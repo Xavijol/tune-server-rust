@@ -954,6 +954,11 @@ pub fn build_album_query(
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
+            // #6121 (forum 2218) — « Artiste de l'album » : la balise
+            // ALBUMARTIST d'une piste de l'album, à défaut l'artiste de
+            // l'album (`ar`, joint sur `al.artist_id`). Même lecture que
+            // `regles_sql::colonne_piste`.
+            "album_artist" => "COALESCE(NULLIF(t.album_artist, ''), ar.name)",
             "album" | "album_title" | "title" => "al.title",
             "composer" => "t.composer",
             "label" => "al.label",
@@ -993,6 +998,7 @@ pub fn build_album_query(
             "genre"
                 | "artist"
                 | "artist_name"
+                | "album_artist"
                 | "album"
                 | "album_title"
                 | "title"

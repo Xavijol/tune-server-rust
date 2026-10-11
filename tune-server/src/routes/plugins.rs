@@ -62,6 +62,9 @@ const ROUTES_GRATUITES: &[(&str, &str, &str)] = &[
         "/snapshot/restauration/apercu",
     ),
     ("playlists-converter", "POST", "/snapshot/restauration"),
+    // Supprimer une copie (décision du 08/10/2026, #5966) : gratuit comme
+    // les copies elles-mêmes.
+    ("playlists-converter", "POST", "/snapshot/supprimer"),
 ];
 
 /// Cette route d'un greffon premium est-elle gratuite ? Correspondance

@@ -1460,6 +1460,13 @@ name = "pg_etiquette_collection_5026"
 path = "tests/pg_etiquette_collection_5026.rs"
 required-features = ["postgres"]
 
+# #6121 — la règle « Artiste de l'album » (collections et playlists) sur
+# PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_artiste_de_l_album_6121"
+path = "tests/pg_artiste_de_l_album_6121.rs"
+required-features = ["postgres"]
+
 # #6122 — la règle « dans les N derniers jours » (date d'ajout, dernière
 # écoute) sur PostgreSQL : les deux aperçus par le vrai routeur.
 [[test]]
