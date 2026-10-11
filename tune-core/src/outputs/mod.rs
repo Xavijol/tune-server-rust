@@ -8,6 +8,7 @@ pub mod airplay2;
 pub mod asio_blocage_4556;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
+// #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;
 #[cfg(test)]
@@ -72,6 +73,8 @@ pub(crate) mod reveil_en_retard_4357;
 pub(crate) mod reveil_rendu_4357;
 /// #3326 — enceinte Sendspin `player@v1` : Tune pousse l'audio horodaté.
 pub mod sendspin;
+#[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
+pub(crate) mod silence_avant_liberation_6133;
 pub mod slimproto;
 pub mod squeezebox;
 /// #3967 — ce que le protocole permet de VÉRIFIER d'une suivante préparée,

@@ -59,6 +59,89 @@ pub struct HqplayerOutput {
     /// Le sondage tourne en boucle : sans ce garde, une réponse d'une forme
     /// inattendue écrirait une ligne toutes les secondes.
     etat_inconnu_dit: Arc<AtomicBool>,
+    /// #4851 — la piste suivante que Tune a posée d'avance dans la playlist
+    /// de HQPlayer, tant que HQPlayer n'est pas passé dessus.
+    ///
+    /// Un `SetNextAVTransportURI` DLNA REMPLACE la suivante ; un
+    /// `PlaylistAdd clear="0"` l'AJOUTE. Sans ce suivi, un second armement
+    /// (« Lire ensuite » dans la fenêtre, préparation expirée) laisserait la
+    /// suivante périmée dans la playlist, jouée AVANT la bonne.
+    enchainement: Arc<std::sync::Mutex<Enchainement>>,
+}
+
+/// #4851 — ce que la sortie sait de la suivante posée chez HQPlayer.
+#[derive(Debug, Default)]
+struct Enchainement {
+    /// L'URI ajoutée d'avance, que HQPlayer n'a pas encore commencé à jouer.
+    suivante: Option<String>,
+    /// La dernière position lue par `Status`, pour voir HQPlayer repartir de
+    /// zéro sur la suivante quand il ne rapporte pas d'URI.
+    position_ms: u64,
+    /// La dernière durée lue par `Status`.
+    duree_ms: u64,
+}
+
+/// #4851 — HQPlayer est-il passé de lui-même sur la suivante posée ?
+///
+/// Deux preuves, l'une ou l'autre :
+/// - `Status` nomme l'URI de la suivante (`<metadata uri="…">`) ;
+/// - la position, qui était dans les 35 dernières secondes de la piste,
+///   retombe sous 5 s. C'est la forme de la transition quand HQPlayer ne
+///   rapporte pas d'URI ; un recul manuel au début de la piste ne se fait
+///   pas, en pratique, à moins de 35 s de sa fin.
+fn passee_sur_la_suivante(
+    suivante: &str,
+    uri_en_cours: Option<&str>,
+    position_avant_ms: u64,
+    duree_avant_ms: u64,
+    position_ms: u64,
+) -> bool {
+    if uri_en_cours.map(str::trim) == Some(suivante) {
+        return true;
+    }
+    duree_avant_ms > 0
+        && position_avant_ms + 35_000 >= duree_avant_ms
+        && position_ms < 5_000
+        && position_avant_ms > position_ms + 5_000
+}
+
+/// #4851 — l'index que HQPlayer donne LUI-MÊME à `uri` dans sa réponse
+/// `PlaylistGet` (`<PlaylistItem index="…" uri="…"/>`).
+///
+/// L'index est relu, jamais calculé : le protocole ne dit pas s'il part de
+/// 0 ou de 1, et `PlaylistRemove` attend celui de HQPlayer.
+fn index_dans_la_playlist(xml: &str, uri: &str) -> Option<String> {
+    use quick_xml::{Reader, events::Event};
+
+    let mut reader = Reader::from_str(xml);
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(tag) | Event::Empty(tag)
+                if tag.name().as_ref().eq_ignore_ascii_case(b"PlaylistItem") =>
+            {
+                let mut index = None;
+                let mut meme_uri = false;
+                for attribute in tag.attributes().flatten() {
+                    let valeur = attribute
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
+                        .ok()?;
+                    match attribute.key.as_ref() {
+                        b"index" => index = Some(valeur.trim().to_string()),
+                        b"uri" => meme_uri = valeur.trim() == uri,
+                        _ => {}
+                    }
+                }
+                if meme_uri {
+                    return index;
+                }
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 impl HqplayerOutput {
@@ -70,7 +153,32 @@ impl HqplayerOutput {
             port,
             connection: Arc::new(Mutex::new(None)),
             etat_inconnu_dit: Arc::new(AtomicBool::new(false)),
+            enchainement: Arc::new(std::sync::Mutex::new(Enchainement::default())),
         }
+    }
+
+    fn enchainement(&self) -> std::sync::MutexGuard<'_, Enchainement> {
+        self.enchainement
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #4851 — retire de la playlist de HQPlayer une suivante posée d'avance
+    /// et devenue périmée. Son index est relu par `PlaylistGet`.
+    ///
+    /// Absente de la playlist, il n'y a rien à retirer. Une playlist
+    /// illisible est une erreur : ajouter la nouvelle suivante par-dessus
+    /// ferait jouer les deux.
+    async fn retirer_la_suivante(&self, uri: &str) -> Result<(), String> {
+        let playlist = self.command(r#"<PlaylistGet picture="0" />"#).await?;
+        let Some(index) = index_dans_la_playlist(&playlist, uri) else {
+            info!(device = %self.name, uri, "hqplayer_suivante_perimee_absente");
+            return Ok(());
+        };
+        let xml = format!(r#"<PlaylistRemove index="{}" />"#, escape_xml(&index));
+        self.action(&xml).await?;
+        info!(device = %self.name, uri, index, "hqplayer_suivante_perimee_retiree");
+        Ok(())
     }
 
     /// Probe a host to find which port HQPlayer is listening on.
@@ -584,7 +692,9 @@ impl OutputTarget for HqplayerOutput {
     }
 
     fn capabilities(&self) -> OutputCapabilities {
-        OutputCapabilities::v1(true, true, true, true, false, false).with_percent_volume()
+        // #4851 — `can_gapless` : la suivante est posée d'avance dans la
+        // playlist de HQPlayer (`set_next_media`), qui enchaîne lui-même.
+        OutputCapabilities::v1(true, true, true, true, false, true).with_percent_volume()
     }
 
     fn host(&self) -> Option<&str> {
@@ -593,6 +703,8 @@ impl OutputTarget for HqplayerOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         info!(device = %self.name, url = media.url, "hqplayer_play");
+        // #4851 — `clear="1"` vide la playlist : plus de suivante posée.
+        self.enchainement().suivante = None;
 
         // ACTION commands go through the fire-and-forget path: HQPlayer 6 executes
         // transport commands but sends NO reply, so blocking on a response would
@@ -636,6 +748,7 @@ impl OutputTarget for HqplayerOutput {
 
     async fn stop(&self) -> Result<(), String> {
         self.action("<Stop />").await?;
+        self.enchainement().suivante = None;
         info!(device = %self.name, "hqplayer_stop");
         Ok(())
     }
@@ -644,6 +757,34 @@ impl OutputTarget for HqplayerOutput {
         let seconds = position_ms as f64 / 1000.0;
         let xml = format!(r#"<Seek position="{seconds:.1}" />"#);
         self.action(&xml).await?;
+        Ok(())
+    }
+
+    /// #4851 — l'enchaînement par la file de HQPlayer : la suivante est
+    /// AJOUTÉE à sa playlist pendant que la piste en cours joue, sans la
+    /// vider (`clear="0"`) et sans `Play`. HQPlayer passe de lui-même à
+    /// l'entrée suivante de sa playlist ; le sondeur le voit à la durée et à
+    /// la position de `Status`, comme après un `SetNextAVTransportURI`.
+    async fn set_next_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        let precedente = self.enchainement().suivante.clone();
+        if let Some(precedente) = precedente {
+            if precedente == media.url {
+                debug!(device = %self.name, url = media.url, "hqplayer_suivante_deja_posee");
+                return Ok(());
+            }
+            self.retirer_la_suivante(&precedente).await?;
+            self.enchainement().suivante = None;
+        }
+        let xml = format!(
+            r#"<PlaylistAdd uri="{}" queued="0" clear="0"></PlaylistAdd>"#,
+            escape_xml(media.url)
+        );
+        self.action(&xml).await.map_err(|e| {
+            warn!(error = %e, "hqplayer_suivante_add_failed");
+            e
+        })?;
+        self.enchainement().suivante = Some(media.url.to_string());
+        info!(device = %self.name, url = media.url, "hqplayer_suivante_posee");
         Ok(())
     }
 
@@ -703,6 +844,27 @@ impl OutputTarget for HqplayerOutput {
 
         let position_ms = (position * 1000.0) as u64;
         let duration_ms = (duration * 1000.0) as u64;
+
+        // #4851 — HQPlayer a-t-il commencé la suivante posée d'avance ? Elle
+        // devient alors la piste en cours, et un armement ultérieur n'a plus
+        // rien à retirer.
+        {
+            let mut suivi = self.enchainement();
+            if let Some(suivante) = suivi.suivante.as_deref()
+                && passee_sur_la_suivante(
+                    suivante,
+                    current_uri.as_deref(),
+                    suivi.position_ms,
+                    suivi.duree_ms,
+                    position_ms,
+                )
+            {
+                debug!(device = %self.name, uri = suivante, "hqplayer_suivante_commencee");
+                suivi.suivante = None;
+            }
+            suivi.position_ms = position_ms;
+            suivi.duree_ms = duration_ms;
+        }
 
         Ok(OutputStatus {
             state,
@@ -834,3 +996,7 @@ mod tests {
 #[cfg(test)]
 #[path = "hqplayer_state_tests_4377.rs"]
 mod state_tests_4377;
+
+#[cfg(test)]
+#[path = "hqplayer_enchainement_tests_4851.rs"]
+pub(crate) mod enchainement_tests_4851;

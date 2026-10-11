@@ -9,6 +9,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tracing::{debug, info, warn};
 
+// #6130 — journal de contexte et détecteur de bruit de la voie conversion.
+mod bruit_suspect_6130;
+
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
     build_wav_header, build_wav_header_bounded_live, build_wav_header_streaming, extract_stream_id,
@@ -851,6 +854,17 @@ pub async fn handle_stream(
         debut: std::time::Instant::now(),
         session: Some(session.clone()),
         fin: "non_suivie",
+        // #6130 — regarde les octets qui partent, sans les toucher. Le corps
+        // part de l'octet de la reprise, ou de celui demandé au-delà de
+        // l'en-tête, sinon de 0 (en-tête compris).
+        observateur: Some(bruit_suspect_6130::ObservateurDeConversion::nouveau(
+            session.clone(),
+            stream_id,
+            user_agent.as_deref().unwrap_or("-"),
+            range_hdr,
+            reprise_exacte.unwrap_or_else(|| range_demande.filter(|s| *s >= 44).unwrap_or(0)),
+            is_wav && !has_icy,
+        )),
     });
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
@@ -1439,6 +1453,9 @@ pub async fn handle_stream(
     let flux = futures_util::StreamExt::map(flux, move |morceau| {
         if let (Ok(o), Some(b)) = (&morceau, bilan.as_mut()) {
             b.octets_envoyes += o.len() as u64;
+            if let Some(obs) = b.observateur.as_mut() {
+                obs.observer(o);
+            }
         }
         morceau
     });
@@ -1479,6 +1496,9 @@ struct BilanDeConnexion {
     /// Cause de fin. Reste [`FIN_CLIENT_PARTI`] si le corps est lâché avant
     /// sa fin : c'est le client qui a fermé. `non_suivie` sur la conversion.
     fin: &'static str,
+    /// #6130 — journal de contexte et détecteur de bruit ; `None` sur le
+    /// mandataire.
+    observateur: Option<bruit_suspect_6130::ObservateurDeConversion>,
 }
 
 /// Le corps a été lâché avant la fin : le client a fermé la connexion.
@@ -1504,12 +1524,16 @@ impl BilanDeConnexion {
             debut: std::time::Instant::now(),
             session: None,
             fin: FIN_CLIENT_PARTI,
+            observateur: None,
         }
     }
 }
 
 impl Drop for BilanDeConnexion {
     fn drop(&mut self) {
+        if let Some(obs) = self.observateur.as_mut() {
+            obs.cloturer();
+        }
         let tuyau = self.session.as_ref().map_or_else(
             || "-".to_string(),
             |s| {
@@ -5359,6 +5383,12 @@ mod reprise_navigateur_5426;
 
 #[cfg(test)]
 mod relais_wav24_b209bf;
+
+#[cfg(test)]
+mod bruit_trois_connexions_b209bruit;
+
+#[cfg(test)]
+mod bruit_suspect_de_bout_en_bout_6130;
 
 #[cfg(test)]
 mod plages_avplayer_b209;

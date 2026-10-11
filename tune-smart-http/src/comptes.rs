@@ -215,6 +215,13 @@ mod tests {
         assert!(!regles_cachables(
             r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#
         ));
+        // #6122 — la durée glissante change avec l'horloge, sans événement.
+        assert!(!regles_cachables(
+            r#"[{"field":"added_at","op":"in_last","value":30}]"#
+        ));
+        assert!(!regles_cachables(
+            r#"[{"field":"last_played_at","op":"in_last","value":7}]"#
+        ));
         assert!(!regles_cachables(
             r#"[{"field":"genre","op":"=","value":"x"},{"field":"play_count","op":">","value":"3"}]"#
         ));

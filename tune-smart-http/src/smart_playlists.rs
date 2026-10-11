@@ -559,6 +559,7 @@ pub(crate) fn build_smart_query_rapport(
 /// |---|---|
 /// | `added_at` | son FICHIER a été modifié après / avant / entre (`t.file_mtime`, la même date que les collections) ; « jamais » : pas de date |
 /// | `last_played_at` | elle a été écoutée après la date ; sa DERNIÈRE écoute est avant / entre ; « jamais » : aucune écoute |
+/// | `added_at` / `last_played_at` « dans les N derniers jours » (#6122) | même lecture qu'« après », le seuil étant « il y a N jours » à l'heure de la requête |
 /// | `credit` | elle porte ce crédit (rôle, artiste, instrument) |
 ///
 /// `None` : le champ n'est pas l'un des trois — l'appelant continue. Un
@@ -587,6 +588,21 @@ fn condition_hors_colonne(
         // « jamais » : un fichier sans date connue — la même lecture que les
         // collections.
         ("added_at", "is_null") => "t.file_mtime IS NULL".to_string(),
+        // #6122 (forum 2217) — « dans les N derniers jours », même lecture que
+        // les collections : seuil lu à l'horloge à chaque requête, comparé en
+        // secondes (`file_mtime`) ou en ISO (`listened_at`).
+        ("added_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.file_mtime >= {}", s.epoch),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
+        ("last_played_at", regles_sql::DANS_LES_DERNIERS_JOURS) => {
+            match regles_sql::seuil_de(value_raw) {
+                Some(s) => format!("t.id IN ({ecoutes} AND listened_at >= {})", s.iso),
+                None => regles_sql::FAUX.to_string(),
+            }
+        }
         ("last_played_at", ">" | ">=") => format!(
             "t.id IN ({ecoutes} AND listened_at {op} {})",
             regles_sql::horodatage_sql(value)
