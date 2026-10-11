@@ -52,10 +52,11 @@ pub const EVENEMENTS_QUI_INVALIDENT: [&str; 5] = [
 ///
 /// Liste BLANCHE : un champ absent d'ici — ou inconnu — rend la collection
 /// non cachable. Se tromper dans ce sens ne coûte qu'une requête.
-pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 19] = [
+pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 20] = [
     "genre",
     "artist",
     "artist_name",
+    "album_artist",
     "album",
     "album_title",
     "title",
@@ -198,6 +199,14 @@ mod tests {
             partiel: false,
             covers: Some(vec![]),
         }
+    }
+
+    /// #6121 — « Artiste de l'album » ne change qu'avec la bibliothèque.
+    #[test]
+    fn l_artiste_de_l_album_est_cachable() {
+        assert!(regles_cachables(
+            r#"[{"field":"album_artist","op":"=","value":"Various Artists"}]"#
+        ));
     }
 
     #[test]

@@ -118,6 +118,12 @@ pub(crate) const CRITERES: &[Critere] = &[
         piste: Some("album"),
         famille: Famille::Texte,
     },
+    // #6121 (forum 2218) — « Artiste de l'album » : la balise ALBUMARTIST,
+    // et à défaut l'artiste de l'album. Même nom aux deux niveaux. Dans une
+    // collection, « Artiste » lit déjà l'artiste de l'album ; dans une
+    // playlist, il lit l'interprète de la PISTE — c'est là que les deux
+    // critères diffèrent.
+    deux("album_artist", Famille::Texte),
     deux("genre", Famille::Texte),
     deux("composer", Famille::Texte),
     deux("label", Famille::Texte),
@@ -421,15 +427,110 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : vingt-neuf définitions, dont vingt-sept aux
-    /// collections (#5530 : « Généré par IA »). Si ce nombre bouge,
+    /// Le compte du client : trente définitions, dont vingt-huit aux
+    /// collections (#6121 : « Artiste de l'album »). Si ce nombre bouge,
     /// `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 29);
+        assert_eq!(CRITERES.len(), 30);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            27
+            28
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #6121 — « Artiste de l'album » (forum 2218).
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus une COMPILATION : album 4 « Ballads »,
+    /// artiste d'album « Various Artists », pistes 5 (Bill Evans) et 6 (Miles
+    /// Davis) balisées ALBUMARTIST=Various Artists. Les pistes 1 à 4 n'ont
+    /// pas la balise : l'artiste de l'album sert de repli.
+    fn avec_compilation() -> SqliteDb {
+        let db = bibliotheque();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (4,'Various Artists'),(5,'Bill Evans'); \
+             INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Ballads',4,2); \
+             INSERT INTO tracks (id, album_id, artist_id, album_artist, title, file_path) VALUES \
+               (5,4,5,'Various Artists','Peace Piece','/m/c/5.flac'), \
+               (6,4,1,'Various Artists','Flamenco Sketches','/m/c/6.flac');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn l_artiste_de_l_album_dans_une_collection() {
+        let db = avec_compilation();
+        assert_eq!(
+            albums(&db, &regle("album_artist", "=", json!("various artists"))),
+            vec![4]
+        );
+        // Sans balise : l'artiste de l'album répond.
+        assert_eq!(
+            albums(&db, &regle("album_artist", "=", json!("Miles Davis"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "contains", json!("VARIOUS"))),
+            vec![4]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "starts_with", json!("John"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "!=", json!("Various Artists"))),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            // En minuscules : le « parmi » des collections compare
+            // `LOWER(col)` aux valeurs telles quelles (défaut commun à tous
+            // les champs texte, hors de ce correctif).
+            albums(
+                &db,
+                &regle("album_artist", "in", json!("autre, various artists"))
+            ),
+            vec![3, 4]
+        );
+        assert!(albums(&db, &regle("album_artist", "is_null", Value::Null)).is_empty());
+        assert_eq!(
+            albums(&db, &regle("album_artist", "is_not_null", Value::Null)),
+            vec![1, 2, 3, 4]
+        );
+        // « Artiste » ne change pas : il lit toujours l'artiste de l'album.
+        assert_eq!(
+            albums(&db, &regle("artist_name", "=", json!("Miles Davis"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("artist", "=", json!("Various Artists"))),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn l_artiste_de_l_album_dans_une_playlist() {
+        let db = avec_compilation();
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "=", json!("Various Artists"))),
+            vec![5, 6]
+        );
+        // Une piste sans balise ALBUMARTIST prend l'artiste de son album.
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "=", json!("miles davis"))),
+            vec![1, 2]
+        );
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "is_not_null", Value::Null)),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        // « Artiste » reste l'interprète de la PISTE : la piste 6 de la
+        // compilation en est.
+        assert_eq!(
+            pistes(&db, &regle("artist", "=", json!("Miles Davis"))),
+            vec![1, 2, 6]
         );
     }
 
