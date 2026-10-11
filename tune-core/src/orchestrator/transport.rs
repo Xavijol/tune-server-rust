@@ -2309,6 +2309,18 @@ impl PlaybackOrchestrator {
             .await
             .now_playing
             .and_then(|np| np.stream_id);
+        // #6059 — un flux natif qui commence DÉJÀ à la position : un `Seek`
+        // par-dessus le décalerait d'autant (et le renderer l'ignore).
+        if let Some(depart_ms) = stream_id
+            .as_deref()
+            .and_then(crate::outputs::dlna_depart_natif::depart_de_session)
+        {
+            info!(
+                zone_id,
+                position_ms, depart_ms, "seek_natif_flux_deja_a_la_position"
+            );
+            return;
+        }
         let session_is_range_seekable = match stream_id {
             Some(ref sid) => self.streamer.is_seekable_session(sid).await,
             None => false,
@@ -2827,6 +2839,24 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        self.reprendre(zone_id, device_id, &session_message, false)
+            .await
+    }
+
+    /// Corps de [`Self::resume_with_session_error_message`].
+    ///
+    /// `apres_refus_de_la_sortie` (#6062) : second et dernier passage, quand
+    /// la sortie a refusé la reprise « sur place » en disant qu'elle a perdu
+    /// sa session pendant la pause (`device_released_on_pause()` devenu
+    /// vrai). La décision est alors prise comme pour un périphérique rendu :
+    /// rétablir à la position, ou l'expliquer — jamais un second `resume()`.
+    async fn reprendre(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: &MessageDeSessionPerdue<'_>,
+        apres_refus_de_la_sortie: bool,
+    ) -> OutputCommandResult<()> {
         // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
         // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
         let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
@@ -2922,13 +2952,14 @@ impl PlaybackOrchestrator {
             // de la sortie : sans elles, le garde vivrait tout le `match`
             // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
             #[allow(clippy::blocks_in_conditions)]
-            let peripherique_rendu = match device_id {
-                Some(did) => match { self.outputs.lock().await.get(did) } {
-                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+            let peripherique_rendu = apres_refus_de_la_sortie
+                || match device_id {
+                    Some(did) => match { self.outputs.lock().await.get(did) } {
+                        Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                        None => false,
+                    },
                     None => false,
-                },
-                None => false,
-            };
+                };
             if peripherique_rendu {
                 info!(
                     zone_id,
@@ -3065,7 +3096,25 @@ impl PlaybackOrchestrator {
             })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            out.checked_resume().await?;
+            if let Err(refus) = out.checked_resume().await {
+                // #6062 — la sortie dit avoir perdu sa session pendant la
+                // pause (Chromecast dont l'application s'est refermée) : la
+                // reprise sur place ne relancera rien, on rétablit à la
+                // position. Une seule fois : le second passage ne revient
+                // jamais ici.
+                if !apres_refus_de_la_sortie && out.device_released_on_pause() {
+                    drop(out);
+                    info!(
+                        zone_id,
+                        position_ms,
+                        error = %refus,
+                        "resume_session_perdue_par_la_sortie_retablissement"
+                    );
+                    return Box::pin(self.reprendre(zone_id, device_id, session_message, true))
+                        .await;
+                }
+                return Err(refus);
+            }
             Some(t)
         } else {
             None
@@ -3610,6 +3659,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
+                // #6059 — un renderer profilé « Seek inopérant » (Yamaha
+                // R-N2000A) : le flux natif est relancé à la position.
+                if let Some(resultat) = self
+                    .deplacer_en_flux_natif_6059(zone_id, did, position_ms, state)
+                    .await
+                {
+                    if let Err(e) = resultat {
+                        warn!(zone_id, error = %e, "seek_natif_echoue");
+                        self.playback.seek(zone_id, original_position_ms).await;
+                        return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                    }
+                    return Ok(());
+                }
                 let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                     OutputCommandError::failed(
                         OutputCommand::Seek,
@@ -3617,6 +3679,21 @@ impl PlaybackOrchestrator {
                     )
                 })?;
                 output.lock().await.checked_seek(position_ms).await?;
+                // #6059 — un fichier natif sur une zone DLNA : le sondeur
+                // vérifiera que le renderer a bien exécuté ce `Seek`.
+                if zone_output_type.as_deref() == Some("dlna")
+                    && let Some(np) = state.now_playing.as_ref()
+                    && np.source == "local"
+                    && let Some(sid) = np.stream_id.as_deref()
+                    && self.fichier_natif_de_session(sid).await.is_some()
+                {
+                    super::seek_natif_6059::noter_seek_envoye(
+                        zone_id,
+                        did,
+                        original_position_ms.max(0) as u64,
+                        position_ms,
+                    );
+                }
             }
         }
         Ok(())
@@ -3634,6 +3711,11 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// #6062 — la traduction, fournie par l'appelant, du message d'une session
+/// perdue (#4193) : `(titre, position mesurée, erreur)`.
+type MessageDeSessionPerdue<'a> =
+    dyn Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync + 'a;
 
 /// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
 /// sortie basculée sur la sienne.

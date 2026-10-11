@@ -1748,6 +1748,10 @@ mod relance_ytdlp_4366;
 mod seek_refuse_par_le_renderer;
 
 mod resolve_local;
+// #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
+pub(crate) mod seek_natif_6059;
+#[cfg(test)]
+mod seek_natif_6059_bout_en_bout;
 
 // #2742 — le crossfeed des pistes de la bibliothèque sur une zone réseau.
 mod crossfeed_bibliotheque_reseau;
@@ -2086,6 +2090,10 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6062 — fil 2199 : une sortie qui a perdu sa session pendant la pause
+/// (Chromecast) refuse la reprise ; la lecture est rétablie à la position.
+#[cfg(test)]
+mod reprise_session_perdue_par_la_sortie_6062;
 /// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
 /// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
 #[cfg(test)]

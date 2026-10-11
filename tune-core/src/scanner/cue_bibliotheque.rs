@@ -192,6 +192,8 @@ struct BalisesImage {
     isrc: Option<String>,
     mbid_enregistrement: Option<String>,
     bpm: Option<f64>,
+    /// La note de la piste (#6123) : celle d'UN enregistrement.
+    note: Option<i32>,
     commentaire: Option<String>,
 }
 
@@ -215,6 +217,7 @@ impl BalisesImage {
             isrc: texte(m.isrc),
             mbid_enregistrement: texte(m.musicbrainz_recording_id),
             bpm: m.bpm.filter(|b| *b > 0.0),
+            note: m.rating.map(i32::from),
             commentaire: texte(m.comment),
         }
     }
@@ -275,6 +278,7 @@ fn completer_par_les_balises(t: &mut Track, b: &BalisesImage, fichier_entier: bo
         combler(&mut t.isrc, &b.isrc);
         combler(&mut t.musicbrainz_recording_id, &b.mbid_enregistrement);
         combler(&mut t.bpm, &b.bpm);
+        combler(&mut t.rating, &b.note);
         combler(&mut t.comments, &b.commentaire);
     }
 }

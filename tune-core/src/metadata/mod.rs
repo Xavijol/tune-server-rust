@@ -24,6 +24,10 @@ pub mod matcher;
 pub mod musicbrainz_release;
 // Les réponses `/release/{mbid}` gardées en base (#4805, idée 3 de MetaRust).
 pub mod musicbrainz_release_cache;
+// La note d'une piste lue dans ses balises, ramenée sur 0 à 5 (#6123).
+pub mod note;
+#[cfg(test)]
+mod note_balises_6123_tests;
 pub mod reidentify;
 // Le type de sortie d'un disque — album, EP, single (#4767).
 pub mod release_type;
@@ -95,6 +99,11 @@ pub struct TrackMetadata {
     pub format: Option<String>,
     pub file_size: Option<u64>,
     pub bpm: Option<f64>,
+    /// La note de la piste lue dans ses balises, de 0 à 5 (#6123) — l'échelle
+    /// et la table de conversion sont dans [`note`]. `None` : aucune balise de
+    /// note, ou une valeur qu'aucune échelle connue ne produit.
+    #[serde(default)]
+    pub rating: Option<u8>,
     /// Le tag « compilation » du fichier — `TCMP` en ID3, `COMPILATION` en
     /// VorbisComment, `cpil` en MP4, tous trois rendus par
     /// `ItemKey::FlagCompilation`.
@@ -752,6 +761,9 @@ struct Id3v2Tags {
     /// frames qui ne commencent pas par `T` etaient toutes ignorees ici : sur
     /// un DSD etiquete avec Picard, l'identifiant n'arrivait donc jamais.
     ufid_frames: Vec<(String, String)>,
+    /// POPM frames : adresse -> octet de note BRUT (0-255, 0 = inconnue).
+    /// Gardé brut : lofty rend un « 1 » pour 0 comme pour 1 (#6123).
+    popm_frames: Vec<(String, u8)>,
     /// Whether an APIC (picture) frame was found
     has_picture: bool,
     /// First embedded picture found, as `(mime_type, image_bytes)`.
@@ -782,6 +794,19 @@ impl Id3v2Tags {
             .or_else(|| self.get_txxx("MusicBrainz Recording Id"))
             .or_else(|| self.get_txxx("MusicBrainz Track Id"))
             .filter(|v| !v.is_empty())
+    }
+
+    /// La note de la piste (#6123) : `POPM`, puis `TXXX:RATING`, puis
+    /// `TXXX:FMPS_Rating`. Voir [`note`] pour l'échelle.
+    fn note(&self) -> Option<u8> {
+        self.popm_frames
+            .iter()
+            .find_map(|(adresse, octet)| note::note_depuis_popm_de(adresse, *octet))
+            .or_else(|| self.get_txxx("RATING").and_then(note::note_depuis_valeur))
+            .or_else(|| {
+                self.get_txxx("FMPS_Rating")
+                    .and_then(note::note_depuis_fmps)
+            })
     }
 
     fn get_txxx(&self, description: &str) -> Option<&str> {
@@ -944,6 +969,7 @@ fn map_id3v22_frame(id: &str) -> Option<&'static str> {
         "TDA" => "TDAT",
         "TXX" => "TXXX", // user-defined text
         "PIC" => "APIC", // attached picture
+        "POP" => "POPM", // popularimeter (note, #6123)
         _ => return None,
     })
 }
@@ -1089,6 +1115,21 @@ fn parse_id3v2_tag(data: &[u8]) -> Option<Id3v2Tags> {
                 if !owner.is_empty() && !id.is_empty() {
                     tags.ufid_frames.push((owner, id));
                 }
+            }
+            continue;
+        }
+
+        // POPM (#6123) : adresse ISO-8859-1 terminée par un octet nul, puis
+        // l'octet de note, puis le compteur (ignoré). Lu AVANT le filtre des
+        // trames de texte, comme UFID.
+        if frame_id == "POPM" {
+            if let Some(nul) = frame_data.iter().position(|b| *b == 0)
+                && let Some(octet) = frame_data.get(nul + 1)
+            {
+                let adresse = String::from_utf8_lossy(&frame_data[..nul])
+                    .trim()
+                    .to_string();
+                tags.popm_frames.push((adresse, *octet));
             }
             continue;
         }
@@ -1278,8 +1319,8 @@ enum Id3ReadSite {
 ///
 /// Exactement ce que [`parse_id3v2_tag`] consomme : les trames de texte
 /// (`T…`, `TXXX` compris) et `UFID`/`UFI`, où Picard écrit l'identifiant
-/// MusicBrainz. Plus `APIC`/`PIC` quand c'est la pochette qu'on est venu
-/// chercher.
+/// MusicBrainz, et `POPM`/`POP`, la note de la piste (#6123). Plus
+/// `APIC`/`PIC` quand c'est la pochette qu'on est venu chercher.
 ///
 /// Le critère est SÉMANTIQUE, pas une taille : on ne devine pas ce qui est
 /// « gros », on sait ce qui est utile. La trame qui fait déborder le budget est
@@ -1291,6 +1332,8 @@ fn id3v2_frame_worth_reading(frame_id: &[u8], want_picture: bool) -> bool {
     frame_id.first() == Some(&b'T')
         || frame_id == b"UFID".as_slice()
         || frame_id == b"UFI".as_slice()
+        || frame_id == b"POPM".as_slice()
+        || frame_id == b"POP".as_slice()
 }
 
 /// Plafond du seul chemin POCHETTE ([`extract_dsf_cover`]).
@@ -2082,6 +2125,12 @@ fn dsf_dff_fallback_complete(
         duration_ms: duration_ms.or(Some(0)),
         bit_depth: Some(1), // DSD is always 1-bit
         bpm: None,
+        // #6123 — `POPM`, `TXXX:RATING`, `TXXX:FMPS_Rating` du tag DSF ; à
+        // défaut, ce que lofty en a lu (DFF).
+        rating: id3_tags
+            .as_ref()
+            .and_then(Id3v2Tags::note)
+            .or_else(|| tag_lofty.and_then(|t| note_de_la_balise(t, path))),
         compilation,
         label,
         catalog_number,
@@ -2174,6 +2223,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
     })
 }
 
@@ -2606,6 +2656,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
     }
 }
 
@@ -2714,6 +2765,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         cover_art: None,
         credits: vec![],
         comment: balises.comment,
+        rating: None,
     })
 }
 
@@ -2790,6 +2842,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         cover_art: None,
         credits: vec![],
         comment: None,
+        rating: None,
     }
 }
 
@@ -3923,6 +3976,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             // #5299 — fichier rangé dans une image ISO : sa taille propre.
             .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         bpm,
+        rating: note_de_la_balise(tag, path),
         compilation,
         label: label_du_tag(&get),
         catalog_number: get(ItemKey::CatalogNumber),
@@ -3957,6 +4011,63 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         // Chemin nominal : les balises ont été lues.
         artist_from_path: false,
     })
+}
+
+/// #6123 — la note de la piste, de 0 à 5, dans la balise que lofty a lue,
+/// puis dans ce qu'il en laisse de côté. Échelle et table : [`note`].
+///
+/// lofty range sous `ItemKey::Popularimeter` le `POPM` ID3, le `RATING`
+/// Vorbis et l'atome MP4 `rate` :
+///
+/// * un `POPM` (ou un `RATING:adresse` Vorbis) arrive DÉJÀ converti, sous la
+///   forme `adresse|étoiles|compteur` — avec la table de l'adresse (WMP,
+///   MusicBee, Picard) ;
+/// * un `RATING` Vorbis sans adresse, ou un `rate` MP4, arrive BRUT : « 4 »,
+///   « 80 ».
+///
+/// Ce que lofty ne surface pas se relit à part, et seulement quand la balise
+/// générique n'a rien donné : `TXXX:RATING` / `TXXX:FMPS_Rating` en ID3 (il ne
+/// garde un `TXXX` que si sa description est une clé qu'il connaît), et
+/// `FMPS_RATING` en Vorbis (clé inconnue de lui). La relecture porte sur la
+/// tête du fichier que lofty vient de lire : elle sort du cache du système.
+///
+/// Un `POPM` dont lofty rend « 1 » est relu aussi : lofty rend 1 pour l'octet
+/// 0 (« note inconnue », que les lecteurs écrivent pour ne garder que le
+/// compteur d'écoutes) comme pour une vraie étoile. Sans relecture possible
+/// (tag ID3 qui n'est pas en tête du fichier : AIFF, WAV), le 1 est gardé.
+fn note_de_la_balise(tag: &lofty::tag::Tag, path: &Path) -> Option<u8> {
+    use lofty::tag::{ItemKey, TagType};
+    let id3 = tag.tag_type() == TagType::Id3v2;
+    let mut un_ambigu = false;
+    for brut in tag.get_strings(ItemKey::Popularimeter) {
+        if brut.contains('|') {
+            match note::etoiles_du_popularimetre(brut) {
+                Some(1) if id3 => un_ambigu = true,
+                Some(n) => return Some(n),
+                None => {}
+            }
+        } else if let Some(n) = note::note_depuis_valeur(brut) {
+            return Some(n);
+        }
+    }
+    match tag.tag_type() {
+        TagType::Id3v2 => {
+            match read_dsf_id3v2_raw(path, Some(0), Id3ReadSite::LeadingProbe, false)
+                .and_then(|brut| parse_id3v2_tag(&brut))
+            {
+                // L'octet brut tranche dès qu'il est là ; s'il manque, le 1
+                // de lofty reste la seule information.
+                Some(trames) => trames
+                    .note()
+                    .or_else(|| (un_ambigu && trames.popm_frames.is_empty()).then_some(1)),
+                None => un_ambigu.then_some(1),
+            }
+        }
+        TagType::VorbisComments => {
+            raw_vorbis_comment(path, "FMPS_RATING").and_then(|v| note::note_depuis_fmps(&v))
+        }
+        _ => None,
+    }
 }
 
 pub fn read_metadata(path: &Path) -> Option<TrackMetadata> {

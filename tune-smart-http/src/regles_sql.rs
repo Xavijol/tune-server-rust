@@ -98,6 +98,10 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "track_number" => nombre("t.track_number"),
         "disc_number" => nombre("t.disc_number"),
         "bpm" => nombre("t.bpm"),
+        // #6123 — la note de la piste lue dans ses balises (0 à 5, sans
+        // profil). `rating`, lui, reste la note de l'ALBUM du profil actif
+        // (`condition_note`).
+        "track_rating" => nombre("t.rating"),
         // #5547 — deux critères d'ALBUM que les collections offraient et que
         // les playlists refusaient (condition FAUSSE). Au niveau de la piste,
         // c'est l'album de la piste qui répond : « albums de 12 pistes » rend
