@@ -33,6 +33,10 @@
 //! **anneau** — [`RETENTION_PAR_PLAYLIST`] emplacements par playlist, le plus
 //! ancien réécrit par le plus récent. Rien ne grossit sans borne.
 //!
+//! Supprimer une copie à la main (décision de Bertrand du 08/10/2026, #5966)
+//! RÉÉCRIT son en-tête et ses pages à `null` : son contenu ne se relit plus,
+//! et l'emplacement reste à l'anneau. Voir [`Snapshots::supprimer`].
+//!
 //! | Clé | Contenu |
 //! |---|---|
 //! | `compteur_playlists_snap` | le dernier numéro de playlist attribué |
@@ -460,13 +464,18 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
             let Ok(r) = serde_json::from_value::<Registre>(v) else {
                 continue;
             };
-            let dernier = self.entete(r.k, r.compteur)?;
+            // Les copies encore lisibles : une copie supprimée ne compte plus,
+            // et une playlist qui n'en a plus aucune sort de la liste.
+            let gardees = self.lister(&r.service, &r.playlist_id)?;
+            let Some(dernier) = gardees.first() else {
+                continue;
+            };
             sortie.push(json!({
                 "service": r.service,
                 "playlist_id": r.playlist_id,
                 "nom": r.nom,
-                "snapshots": r.compteur.min(RETENTION_PAR_PLAYLIST),
-                "dernier_le_ms": dernier.map(|d| d.pris_le_ms),
+                "snapshots": gardees.len(),
+                "dernier_le_ms": dernier.pris_le_ms,
             }));
         }
         Ok(sortie)
@@ -509,6 +518,62 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
         }
         pistes.truncate(entete.total);
         Ok(Snapshot { entete, pistes })
+    }
+
+    // -----------------------------------------------------------------------
+    // Supprimer une copie (décision de Bertrand du 08/10/2026, #5966)
+    // -----------------------------------------------------------------------
+
+    /// Supprimer UNE copie datée, à la demande de l'utilisateur.
+    ///
+    /// Le stockage du greffon ne sait pas effacer une clé, et l'hôte n'offre
+    /// aucune capacité de suppression (`aucune_capacite_hote_ne_supprime_4716`) :
+    /// la copie est donc **réécrite à `null`** — son en-tête d'abord, puis ses
+    /// pages. Son contenu (nom, pistes) ne se relit plus, et l'emplacement
+    /// reste à l'anneau, qui le réécrira. Ni la playlist chez son service, ni
+    /// les autres copies ne sont touchées.
+    ///
+    /// L'identifiant n'est JAMAIS une clé du stockage : seul `snap-<K>-<N>`,
+    /// en chiffres et sous sa forme canonique, est accepté. Tout le reste
+    /// (`..`, `/`, une autre clé du greffon) est refusé avant toute écriture.
+    pub fn supprimer(&self, snapshot_id: &str) -> Result<Value, String> {
+        let (k, n) = decoder_identifiant(snapshot_id)
+            .filter(|&(k, n)| identifiant(k, n) == snapshot_id)
+            .ok_or_else(|| {
+                format!(
+                    "demande_invalide : « {snapshot_id} » n'est pas l'identifiant \
+                     d'une copie (snap-<K>-<N>)"
+                )
+            })?;
+        let entete = self.entete(k, n)?.ok_or_else(|| {
+            format!(
+                "snapshot_expire : {snapshot_id} n'est plus gardé (rétention : \
+                 {RETENTION_PAR_PLAYLIST} par playlist, ou déjà supprimé) ou n'a \
+                 jamais existé"
+            )
+        })?;
+        let place = emplacement(n);
+        // L'en-tête D'ABORD : c'est le point de validation. Une coupure après
+        // lui laisse des pages orphelines qu'aucun en-tête ne désigne, et que
+        // le prochain snapshot de cet emplacement réécrira.
+        self.hote
+            .kv_set(&format!("snap:{k}:{place}"), &Value::Null)?;
+        for i in 0..entete.pages {
+            self.hote
+                .kv_set(&format!("snap:{k}:{place}:p:{i}"), &Value::Null)?;
+        }
+        self.hote.journal(
+            "info",
+            &format!(
+                "snapshot {snapshot_id} de {}/{} supprimé à la demande",
+                entete.service, entete.playlist_id
+            ),
+        );
+        Ok(json!({
+            "snapshot_id": snapshot_id,
+            "supprime": true,
+            "playlists_touchees": false,
+        }))
     }
 
     // -----------------------------------------------------------------------
@@ -758,7 +823,11 @@ impl<'h, H: Hote + ?Sized> Snapshots<'h, H> {
         if n == 0 {
             return Ok(None);
         }
-        let Some(v) = self.kv_valeur(&format!("snap:{k}:{}", emplacement(n)))? else {
+        // `null` : une copie supprimée (voir [`Self::supprimer`]).
+        let Some(v) = self
+            .kv_valeur(&format!("snap:{k}:{}", emplacement(n)))?
+            .filter(|v| !v.is_null())
+        else {
             return Ok(None);
         };
         let e: EnTeteSnapshot =
