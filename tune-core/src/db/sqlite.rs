@@ -735,7 +735,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- chemin vit ici, avec les bornes de la piste dans le fichier.
     cue_media_path TEXT,
     cue_start_ms INTEGER,
-    cue_end_ms INTEGER
+    cue_end_ms INTEGER,
+    -- Note de la piste lue dans ses balises, 0 a 5 (#6123, migration 124).
+    -- NULL = le fichier n'en porte pas. Echelle : `metadata::note`.
+    rating INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (

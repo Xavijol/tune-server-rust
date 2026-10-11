@@ -949,6 +949,10 @@ pub fn build_album_query(
             "track_number" => "CAST(t.track_number AS INTEGER)",
             "disc_number" => "CAST(t.disc_number AS INTEGER)",
             "bpm" => "CAST(t.bpm AS INTEGER)",
+            // #6123 — la note d'une piste de l'album (balises, 0 à 5) : un
+            // album passe dès qu'UNE de ses pistes passe. `rating` reste la
+            // note de l'ALBUM, traitée plus haut.
+            "track_rating" => "t.rating",
             _ => continue,
         };
 
