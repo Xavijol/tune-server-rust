@@ -60,6 +60,13 @@ const fn nombre(sql: &'static str) -> Colonne {
     }
 }
 
+/// #6124 — la VERSION d'une piste (balise `VERSION` : original, réédition,
+/// remaster…), rangée au scan dans `track_metadata` et non dans `tracks`.
+/// Sous-requête corrélée sur la clé primaire `(track_id, key)` ; alias `t`
+/// imposé. Partagée par les playlists et les collections.
+pub(crate) const SQL_VERSION_DE_LA_PISTE: &str =
+    "(SELECT tmv.value FROM track_metadata tmv WHERE tmv.track_id = t.id AND tmv.key = 'version')";
+
 /// Le vocabulaire des PISTES (playlists intelligentes).
 ///
 /// Les alias sont délibérés : l'éditeur web écrit `artist`, d'anciennes
@@ -95,6 +102,11 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         // profil). `rating`, lui, reste la note de l'ALBUM du profil actif
         // (`condition_note`).
         "track_rating" => nombre("t.rating"),
+        // #6124 — l'année de sortie ORIGINALE, celle de l'album de la piste
+        // (`albums.original_year`, mêmes colonnes que `build_album_query`) ;
+        // la VERSION, balise de la piste rangée dans `track_metadata`.
+        "original_year" => nombre("al.original_year"),
+        "version" => texte(SQL_VERSION_DE_LA_PISTE),
         // #5547 — deux critères d'ALBUM que les collections offraient et que
         // les playlists refusaient (condition FAUSSE). Au niveau de la piste,
         // c'est l'album de la piste qui répond : « albums de 12 pistes » rend

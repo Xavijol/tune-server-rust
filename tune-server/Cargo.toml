@@ -1581,3 +1581,10 @@ path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
 [[test]]
 name = "playlist_manager_alias_deprecies"
 path = "tests/playlist_manager_alias_deprecies.rs"
+
+# #6124 — la date de sortie originale et la version sur PostgreSQL : règles
+# des collections et des playlists, concordance de l'album, fiche de piste.
+[[test]]
+name = "pg_balises_6124"
+path = "tests/pg_balises_6124.rs"
+required-features = ["postgres"]
