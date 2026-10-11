@@ -986,6 +986,11 @@ pub fn build_album_query(
             // album passe dès qu'UNE de ses pistes passe. `rating` reste la
             // note de l'ALBUM, traitée plus haut.
             "track_rating" => "t.rating",
+            // #6124 — l'année ORIGINALE est une donnée d'album ; la VERSION,
+            // une balise de piste rangée dans `track_metadata` : l'album
+            // passe si l'une de ses pistes la porte.
+            "original_year" => "CAST(al.original_year AS INTEGER)",
+            "version" => crate::regles_sql::SQL_VERSION_DE_LA_PISTE,
             _ => continue,
         };
 
@@ -1004,6 +1009,7 @@ pub fn build_album_query(
                 | "source"
                 | "folder"
                 | "file_path"
+                | "version"
         );
         let int_val = || value.parse::<i64>().unwrap_or(0);
 
