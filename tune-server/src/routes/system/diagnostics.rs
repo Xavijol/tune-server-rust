@@ -837,10 +837,14 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         {
             // #5612 — hors de l'ordonnanceur et borné : un balayage bloqué
             // dans le greffon ALSA de PipeWire ne doit pas figer le serveur.
+            // #6119 — jamais pendant qu'une sortie locale joue : la page Zones
+            // charge cette fiche, et sonder ASIO y coupait la lecture WASAPI.
             let devs: Vec<String> =
-                tune_core::outputs::local::list_audio_devices_with_backend_bounded(
-                    audio_backend_pref,
-                )
+                crate::background::parc_local_sans_couper_la_lecture(&state, || {
+                    tune_core::outputs::local::list_audio_devices_with_backend_bounded(
+                        audio_backend_pref,
+                    )
+                })
                 .await
                 .iter()
                 .map(|d| d.name.clone())
