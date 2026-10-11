@@ -3203,6 +3203,29 @@ impl PlaybackOrchestrator {
             // porte le poste de relève, et donc un égaliseur activé ou changé
             // en cours de piste sans refaire la session UPnP.
             let relais_en_vol = !is_local_output;
+            // #6130 — diagnostic : le contexte relu par le journal de chaque
+            // connexion du renderer. Ne change rien au rendu.
+            let contexte = crate::http::streamer::ContexteDeConversion {
+                zone_id: req.zone_id,
+                source: format!(
+                    "bibliotheque fichier={} source={}/{} decodeur_sortie={out_sr}/{out_bd} canaux={channels}",
+                    std::path::Path::new(file_path.as_str())
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("-"),
+                    decision.sample_rate,
+                    decision.bit_depth,
+                ),
+                chaine: if relais || relais_en_vol {
+                    dsp.decrire()
+                } else {
+                    "aucun_relais (sortie locale : ses etages sont appliques par sa boucle)"
+                        .to_string()
+                },
+                precedente: self.decrire_la_piste_precedente(req.zone_id).await,
+            };
+            self.poser_le_contexte_de_conversion(&session_id, contexte)
+                .await;
             let tx = if relais || relais_en_vol {
                 if relais {
                     tracing::info!(zone_id = req.zone_id, "local_channel_dsp_relay_inserted");

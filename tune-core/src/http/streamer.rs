@@ -216,6 +216,28 @@ impl StreamInfo {
 /// #5716 — ce que l'on fait du codec reconnu par la sonde d'une radio.
 pub type ObservateurDeCodec = Box<dyn FnOnce(&'static str) + Send>;
 
+/// #6130 — ce qui a FABRIQUÉ un flux de conversion, posé par l'orchestrateur
+/// au moment où il ouvre la session, et relu par le journal de chaque
+/// connexion HTTP (`conversion_connexion_contexte`, `bruit_suspect`).
+///
+/// Diagnostic seulement : rien ne le lit pour décider du rendu. Le bruit
+/// blanc de la zone 10 du .18 (11/10) ne se reproduit pas à la demande ; sans
+/// ces faits au journal, la prochaine occurrence ne dirait ni d'où venait le
+/// PCM, ni quels étages l'avaient traité, ni ce que la zone jouait avant.
+#[derive(Debug, Clone, Default)]
+pub struct ContexteDeConversion {
+    pub zone_id: i64,
+    /// La source : service ou bibliothèque, codec, format annoncé, et ce que
+    /// le décodeur rend (fréquence / profondeur).
+    pub source: String,
+    /// La chaîne d'étages DSP et de greffons, dans l'ordre d'exécution, avec
+    /// la fréquence d'entrée et de sortie de chacun.
+    pub chaine: String,
+    /// Ce que la zone jouait juste avant (radio ou piste, fréquence), et si sa
+    /// session était encore ouverte.
+    pub precedente: String,
+}
+
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
@@ -266,6 +288,12 @@ pub struct StreamSession {
     /// PCM nu, sans RIFF. Le consommateur qui voit passer l'en-tête le range
     /// ici ; chaque nouvelle connexion partant de l'octet 0 le reçoit d'abord.
     pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
+    /// #6130 — voir [`ContexteDeConversion`]. Posé une fois, par
+    /// l'orchestrateur ; vide sur les sessions qui n'en ont pas.
+    pub contexte_de_conversion: std::sync::OnceLock<ContexteDeConversion>,
+    /// #6130 — un `bruit_suspect` a déjà été signalé sur ce flux : un WARN au
+    /// plus par flux, quel que soit le nombre de connexions.
+    pub bruit_suspect_signale: std::sync::atomic::AtomicBool,
     /// Position, DANS LE FLUX, du prochain octet que le canal rendra.
     ///
     /// Un canal de conversion est un TUYAU : il ne connaît qu'un sens et ne
@@ -582,6 +610,8 @@ impl StreamSession {
             detected_bit_depth: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
+            contexte_de_conversion: std::sync::OnceLock::new(),
+            bruit_suspect_signale: std::sync::atomic::AtomicBool::new(false),
             octets_du_canal: std::sync::atomic::AtomicU64::new(0),
             retenue: std::sync::Mutex::new(RetenueDuCanal::default()),
             created_at: Instant::now(),

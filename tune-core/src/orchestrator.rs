@@ -1555,6 +1555,50 @@ impl StreamingDsp {
         self.compensation.as_ref().map(|c| c.cible_db())
     }
 
+    /// #6130 — la chaîne telle que le journal de conversion la décrit, dans
+    /// l'ordre de [`Self::process`] : chaque étage avec la fréquence à
+    /// laquelle il a été PRÉPARÉ, puis l'entrée et la sortie du flux qu'il
+    /// traite. Aucun étage ne rééchantillonne : entrée et sortie valent la
+    /// cadence du porteur, et un étage préparé à une autre cadence que celle
+    /// du flux se lit donc d'un coup d'œil. Diagnostic seulement.
+    fn decrire(&self) -> String {
+        let flux = self.sample_rate;
+        let mut etages: Vec<String> = Vec::new();
+        if let Some(f) = self.replaygain {
+            etages.push(format!("replaygain:x{f:.4}@{flux}"));
+        }
+        if let Some(eq) = self.eq.as_ref() {
+            etages.push(eq.decrire());
+        }
+        if self.convolver.is_some() {
+            etages.push(format!("convolveur@{flux}"));
+        }
+        if let Some(cf) = self.crossfeed.as_ref() {
+            let inerte = if self.channels == 2 { "" } else { "(inerte)" };
+            etages.extend(cf.decrire().into_iter().map(|e| format!("{e}{inerte}")));
+        }
+        if let Some(c) = self.compensation.as_ref() {
+            etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
+        }
+        if etages.is_empty() {
+            return format!("aucun_etage canaux={}", self.channels);
+        }
+        let etages: Vec<String> = etages
+            .into_iter()
+            .map(|e| format!("{e}[{flux}->{flux}]"))
+            .collect();
+        format!(
+            "{} canaux={}{}",
+            etages.join(" > "),
+            self.channels,
+            if self.en_vol.is_some() {
+                " releve_en_vol"
+            } else {
+                ""
+            }
+        )
+    }
+
     /// Applique les trois étages EN PLACE.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
@@ -1741,6 +1785,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #6130 — le contexte d'un flux de conversion, pour son journal.
+mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
 mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
