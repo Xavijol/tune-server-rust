@@ -200,17 +200,17 @@ mod tests {
         let rejoue = pilote.ce_qui_est_rejoue();
         pilote.arreter();
         fil.join().unwrap();
-        assert!(
-            confirme,
-            "le silence doit être confirmé avant la libération"
-        );
-        assert!(garde.blocs_muets() >= BLOCS_MUETS_REQUIS);
         let non_nuls = rejoue.iter().filter(|&&s| s != 0).count();
         assert_eq!(
             non_nuls, 0,
             "#6133 : après l'arrêt, le pilote ASIO rejoue {non_nuls} échantillons de musique \
              au lieu du silence (double tampon non réécrit avant pause)"
         );
+        assert!(
+            confirme,
+            "le silence doit être confirmé avant la libération"
+        );
+        assert!(garde.blocs_muets() >= BLOCS_MUETS_REQUIS);
     }
 
     /// Pilote qui ne rappelle plus : l'attente est bornée et la libération a
