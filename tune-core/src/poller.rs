@@ -1308,6 +1308,11 @@ mod depassement_duree_nagit_pas_guard;
 #[cfg(test)]
 mod lire_ensuite_dans_la_fenetre_gapless;
 
+/// #4851 — une zone HQPlayer native enchaîne par la playlist de HQPlayer :
+/// la vraie `HqplayerOutput` face à un faux HQPlayer XML, sondeur réel.
+#[cfg(test)]
+mod hqplayer_enchainement_4851;
+
 /// #5143 — une suivante BANNIE n'est ni préchargée, ni armée, ni jouée après
 /// un échec : préchargement, enchaînement sans blanc et reprise désignent la
 /// même suivante que l'avance de la file.
