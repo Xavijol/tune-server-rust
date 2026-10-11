@@ -1271,7 +1271,7 @@ impl PlaybackOrchestrator {
     /// Quatrième temps : l'envoi à la sortie. Rend `(output_sent,
     /// output_error)`, le couple dont dépendent l'annonce, l'historique et
     /// l'arrêt immédiat en cas de refus.
-    async fn envoyer_a_la_sortie(
+    pub(super) async fn envoyer_a_la_sortie(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,
@@ -1439,6 +1439,31 @@ impl PlaybackOrchestrator {
                         "initial_prebuffer_done"
                     );
                 }
+            }
+
+            // #5522 — le producteur de la session est déjà mort (téléchargement
+            // amont refusé, `abandonner_la_session_de_transcodage`) : la
+            // session n'existe plus. L'envoyer quand même faisait tirer à la
+            // sortie un `/stream/<id>` en 404, et la zone restait « en
+            // lecture » à 0:00 sans bandeau (Gros Bidon, fil 2212). On ne
+            // l'envoie pas : `output_sent=false` avec un motif arrête la zone
+            // et affiche ce motif, comme un refus de la sortie.
+            if let Some(ref sid) = resolved.stream_id
+                && !self.streamer.session_alive(sid).await
+            {
+                warn!(
+                    zone_id = req.zone_id,
+                    stream_id = %sid,
+                    source = %resolved.source,
+                    "envoi_annule_session_de_flux_abandonnee"
+                );
+                return (
+                    false,
+                    Some(format!(
+                        "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
+                        resolved.title, resolved.source
+                    )),
+                );
             }
 
             // A local output opens this URL in its own reader thread just

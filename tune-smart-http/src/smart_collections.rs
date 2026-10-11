@@ -809,6 +809,20 @@ pub fn build_album_query(
                 "is_null" => "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
                      WHERE t2.file_mtime IS NULL)"
                     .to_string(),
+                // #6122 (forum 2217) — « dans les N derniers jours » : le
+                // seuil se lit à l'horloge ICI, à chaque requête. Comparé en
+                // secondes à `file_mtime`, sans `DATETIME` (propre à SQLite).
+                // Un N illisible ne retient rien, jamais tout.
+                crate::regles_sql::DANS_LES_DERNIERS_JOURS => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime >= {})",
+                            s.epoch
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
+                }
                 _ => continue,
             };
             conditions.push(cond);
@@ -891,6 +905,19 @@ pub fn build_album_query(
                          JOIN listen_history lh ON lh.track_id = t3.id \
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
                     )
+                }
+                // #6122 — « écouté dans les N derniers jours » : une écoute au
+                // moins depuis le seuil, lu à l'horloge à chaque requête.
+                ("last_played_at", crate::regles_sql::DANS_LES_DERNIERS_JOURS) => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                             JOIN listen_history lh ON lh.track_id = t3.id \
+                             WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
+                            s.iso
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
                 }
                 ("last_played_at", "is_null") => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \

@@ -157,6 +157,58 @@ pub(crate) fn bornes_de_dates(valeur: Option<&serde_json::Value>) -> Option<(Str
     Some((horodatage_sql(lo), horodatage_sql(hi)))
 }
 
+/// #6122 (forum 2217) — l'opérateur « dans les N derniers jours » des dates :
+/// une durée GLISSANTE, là où « après » attend une date fixe.
+///
+/// La règle enregistre N, jamais une date : l'instant « il y a N jours » se lit
+/// à l'horloge à CHAQUE traduction, donc à chaque requête. Une collection
+/// « ajoutés dans les 30 derniers jours » avance seule avec le calendrier.
+pub(crate) const DANS_LES_DERNIERS_JOURS: &str = "in_last";
+
+/// Au-delà, la durée n'a plus de sens (et la date ne se calcule plus).
+const JOURS_MAX: i64 = 36_500;
+
+/// Le N d'une règle « dans les N derniers jours » : un entier STRICTEMENT
+/// positif, en nombre JSON ou en chiffres. `None` sinon — l'appelant pose
+/// alors une condition FAUSSE, jamais « pas de condition ».
+pub(crate) fn jours_de(valeur: Option<&serde_json::Value>) -> Option<i64> {
+    let n = match valeur? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.trim().parse::<i64>().ok()?,
+        _ => return None,
+    };
+    (1..=JOURS_MAX).contains(&n).then_some(n)
+}
+
+/// L'instant « il y a N jours », sous les deux formes que la base compare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Seuil {
+    /// En secondes depuis l'époque : la forme de `tracks.file_mtime` (REAL
+    /// sur SQLite, DOUBLE PRECISION sur PostgreSQL).
+    pub epoch: i64,
+    /// En texte ISO 8601 UTC, entre apostrophes : la forme de
+    /// `listen_history.listened_at` (TEXT sur les deux moteurs).
+    pub iso: String,
+}
+
+/// Le seuil de N jours avant `maintenant`.
+///
+/// Des LITTÉRAUX, pas `DATETIME('now', …)` : cette écriture est propre à
+/// SQLite, et PostgreSQL la refuse. Un nombre et une chaîne ISO se comparent
+/// de la même façon sur les deux moteurs.
+pub(crate) fn seuil_jours(jours: i64, maintenant: chrono::DateTime<chrono::Utc>) -> Seuil {
+    let instant = maintenant - chrono::Duration::days(jours);
+    Seuil {
+        epoch: instant.timestamp(),
+        iso: format!("'{}'", instant.format("%Y-%m-%dT%H:%M:%SZ")),
+    }
+}
+
+/// Le seuil d'une règle « dans les N derniers jours », lu à l'horloge MAINTENANT.
+pub(crate) fn seuil_de(valeur: Option<&serde_json::Value>) -> Option<Seuil> {
+    jours_de(valeur).map(|n| seuil_jours(n, chrono::Utc::now()))
+}
+
 /// Les deux bornes d'une règle « entre » portant sur des NOMBRES.
 ///
 /// Même lecture que `build_album_query` : un tableau `[lo, hi]`, ou la chaîne
@@ -481,6 +533,52 @@ pub(crate) fn condition_marquage_ia_colonne(col: &str, op: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6122 — N se lit en nombre ou en chiffres ; zéro, négatif, illisible
+    /// ou démesuré : rien (la règle rendra FAUX).
+    #[test]
+    fn le_nombre_de_jours_se_lit_ou_se_refuse() {
+        use serde_json::json;
+        assert_eq!(jours_de(Some(&json!(30))), Some(30));
+        assert_eq!(jours_de(Some(&json!("30"))), Some(30));
+        assert_eq!(jours_de(Some(&json!(" 7 "))), Some(7));
+        for v in [
+            json!(0),
+            json!(-5),
+            json!("abc"),
+            json!(""),
+            json!(2.5),
+            json!(["30"]),
+            json!(36_501),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(jours_de(Some(&v)), None, "{v}");
+        }
+        assert_eq!(jours_de(None), None);
+    }
+
+    /// #6122 — le seuil suit l'horloge : la même règle (N = 30) lue un jour
+    /// plus tard recule son seuil d'un jour. Rien n'est figé à l'enregistrement.
+    #[test]
+    fn le_seuil_glisse_avec_l_horloge() {
+        use chrono::TimeZone;
+        let t0 = chrono::Utc
+            .with_ymd_and_hms(2026, 10, 11, 12, 0, 0)
+            .unwrap();
+        let s = seuil_jours(30, t0);
+        assert_eq!(s.iso, "'2026-09-11T12:00:00Z'");
+        assert_eq!(s.epoch, t0.timestamp() - 30 * 86_400);
+        let lendemain = seuil_jours(30, t0 + chrono::Duration::days(1));
+        assert_eq!(lendemain.iso, "'2026-09-12T12:00:00Z'");
+        assert_eq!(lendemain.epoch - s.epoch, 86_400);
+        // Et `seuil_de` lit bien l'horloge courante.
+        let maintenant = chrono::Utc::now().timestamp();
+        let vivant = seuil_de(Some(&serde_json::json!(1))).unwrap();
+        assert!(
+            (maintenant - 86_400 - vivant.epoch).abs() <= 5,
+            "{vivant:?}"
+        );
+    }
 
     #[test]
     fn le_compositeur_est_une_colonne_texte() {

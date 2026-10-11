@@ -1467,6 +1467,13 @@ name = "pg_artiste_de_l_album_6121"
 path = "tests/pg_artiste_de_l_album_6121.rs"
 required-features = ["postgres"]
 
+# #6122 — la règle « dans les N derniers jours » (date d'ajout, dernière
+# écoute) sur PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_date_relative_6122"
+path = "tests/pg_date_relative_6122.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service

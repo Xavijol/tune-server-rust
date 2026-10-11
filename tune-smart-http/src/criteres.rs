@@ -69,7 +69,9 @@ impl Famille {
             Famille::Source => &["=", "!="],
             Famille::Repertoire => &["starts_with", "contains"],
             Famille::Vide => &["is_null", "is_not_null"],
-            Famille::Horodatage => &[">", "<", "between", "is_null"],
+            // #6122 — « dans les N derniers jours » (`in_last`), la durée
+            // glissante ; « après » garde sa date fixe.
+            Famille::Horodatage => &[">", "<", "between", "in_last", "is_null"],
             Famille::Credit => &["has"],
             Famille::RefCollection | Famille::RefPlaylist => &["in", "not_in"],
             Famille::Favori | Famille::Etiquette => &["is", "is_not"],
@@ -198,6 +200,7 @@ pub(crate) mod tests {
         match (f, op) {
             (_, "is_null" | "is_not_null") => Value::Null,
             (Famille::Horodatage, "between") => json!(["2020-01-01", "2030-01-01"]),
+            (Famille::Horodatage, "in_last") => json!(30),
             (_, "between") => json!([1, 5]),
             (Famille::Horodatage, _) => json!("now-30d"),
             (Famille::Nombre | Famille::Compte, _) => json!(3),
@@ -760,6 +763,99 @@ pub(crate) mod tests {
             ),
             vec![1]
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // #6122 — « dans les N derniers jours » (forum 2217).
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus des dates RÉCENTES, posées par rapport à
+    /// l'horloge du test (les dates de `bibliotheque()` datent de 2024 et
+    /// 2019) : album 4 « Récent », piste 5 dont le fichier a 5 jours ; une
+    /// écoute de la piste 3 (Giant Steps) il y a 2 jours, une de la piste 4
+    /// (Seul) il y a 40 jours.
+    fn avec_dates_recentes() -> SqliteDb {
+        let db = bibliotheque();
+        let maintenant = chrono::Utc::now();
+        let il_y_a = |j: i64| maintenant - chrono::Duration::days(j);
+        let iso = |j: i64| il_y_a(j).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        db.execute_batch(&format!(
+            "INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Récent',3,1); \
+             INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_mtime) VALUES \
+               (5,4,3,'Neuf','/m/neuf/5.flac',{mtime}); \
+             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
+               (3,'Giant Steps','{deux}'), (4,'Solo','{quarante}');",
+            mtime = il_y_a(5).timestamp(),
+            deux = iso(2),
+            quarante = iso(40),
+        ))
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn ajoutes_dans_les_n_derniers_jours_dans_une_collection() {
+        let db = avec_dates_recentes();
+        let r = |v: Value| albums(&db, &regle("added_at", "in_last", v));
+        assert_eq!(r(json!(30)), vec![4]);
+        // La valeur en chiffres, comme l'enverrait un champ texte.
+        assert_eq!(r(json!("30")), vec![4]);
+        // Le fichier a 5 jours : hors des 3 derniers.
+        assert!(r(json!(3)).is_empty());
+        // Même ensemble que l'ancienne écriture relative « après now-30d » —
+        // qui, elle, ne change pas.
+        assert_eq!(
+            albums(&db, &regle("added_at", ">", json!("now-30d"))),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn ecoutes_dans_les_n_derniers_jours_dans_une_collection() {
+        let db = avec_dates_recentes();
+        let r = |v: Value| albums(&db, &regle("last_played_at", "in_last", v));
+        // Giant Steps, écouté il y a 2 jours ; Kind of Blue (2024) non.
+        assert_eq!(r(json!(7)), vec![2]);
+        assert_eq!(r(json!(60)), vec![2, 3]);
+        assert!(r(json!(1)).is_empty());
+    }
+
+    #[test]
+    fn dans_les_n_derniers_jours_dans_une_playlist() {
+        let db = avec_dates_recentes();
+        assert_eq!(
+            pistes(&db, &regle("added_at", "in_last", json!(30))),
+            vec![5]
+        );
+        assert!(pistes(&db, &regle("added_at", "in_last", json!(3))).is_empty());
+        assert_eq!(
+            pistes(&db, &regle("last_played_at", "in_last", json!(7))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("last_played_at", "in_last", json!("60"))),
+            vec![3, 4]
+        );
+    }
+
+    /// Un N illisible, nul ou négatif ne retient RIEN — jamais toute la
+    /// bibliothèque (#1231) — et la playlist le dit dans son rapport.
+    #[test]
+    fn un_nombre_de_jours_illisible_ne_retient_rien() {
+        let db = avec_dates_recentes();
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for champ in ["added_at", "last_played_at"] {
+            for v in [json!(0), json!(-3), json!("abc"), Value::Null] {
+                let r = regle(champ, "in_last", v.clone());
+                assert!(albums(&db, &r).is_empty(), "{champ} {v}");
+                let (w, _o, _l) = build_album_query(&r, "all", "title", "asc", None, &ctx);
+                assert!(w.contains(crate::regles_sql::FAUX), "{champ} {v} : {w}");
+                let (w, _o, _l, refusees) =
+                    build_smart_query_rapport(&r, "all", "title", "asc", None, &ctx);
+                assert!(w.contains(crate::regles_sql::FAUX), "{champ} {v} : {w}");
+                assert!(!refusees.is_empty(), "{champ} {v} : refus non signalé");
+            }
+        }
     }
 }
 
