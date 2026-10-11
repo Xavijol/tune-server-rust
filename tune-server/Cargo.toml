@@ -1474,6 +1474,14 @@ name = "pg_date_relative_6122"
 path = "tests/pg_date_relative_6122.rs"
 required-features = ["postgres"]
 
+# #6143 — les règles de date « après », « avant », « entre » et les formes
+# relatives (`now-90d`) sur PostgreSQL, sans `DATETIME()` propre à SQLite :
+# un témoin par opérateur, collections et playlists.
+[[test]]
+name = "pg_regles_de_date_6143"
+path = "tests/pg_regles_de_date_6143.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service

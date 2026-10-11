@@ -140,20 +140,84 @@ pub(crate) fn texte_de(valeur: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// Une date de règle en SQL : les formes relatives `now-90d`, `90d`, `90`
-/// valent « il y a N jours » ; tout le reste est une date littérale.
+/// #6143 — l'instant que désigne une date de règle, calculé en RUST.
 ///
-/// Sortie de `smart_collections` (#5547) sans un caractère changé, pour que
-/// les playlists lisent une date comme les collections.
-pub(crate) fn horodatage_sql(input: &str) -> String {
-    // Relative forms: "now-90d", "90d", "90" — N days ago. The seeded
-    // "🆕 Récents" collection stores the bare "90d" form, which used to fall
-    // through to a literal string ('90d') that no date ever compares against.
+/// Les formes relatives `now-90d`, `90d`, `90` valent « il y a N jours » à
+/// l'horloge `maintenant` (la collection « 🆕 Récents » enregistre la forme
+/// nue `90d`). Sinon, une date ISO : `AAAA-MM-JJ`, avec ou sans heure, lue en
+/// UTC comme le faisait `DATETIME(…, 'unixepoch')`. `None` si illisible.
+///
+/// Ces formes passaient par `DATETIME('now', '-N days')` et
+/// `DATETIME(t.file_mtime, 'unixepoch')`, deux écritures propres à SQLite :
+/// sur PostgreSQL, toute règle « après », « avant » ou « entre » faisait
+/// tomber l'aperçu. Comme `in_last` (#6141), la borne est désormais un
+/// LITTÉRAL que les deux moteurs comparent de la même façon.
+/// Le N d'une date relative `now-Nd`, `Nd` ou `N` ; `None` pour toute autre
+/// écriture. Un N hors d'échelle reste borné (30 jours s'il ne se lit pas).
+fn jours_relatifs(input: &str) -> Option<i64> {
     let rest = input.strip_prefix("now-").unwrap_or(input);
     let digits = rest.strip_suffix('d').unwrap_or(rest);
-    if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-        let days: i64 = digits.parse().unwrap_or(30);
-        return format!("DATETIME('now', '-{days} days')");
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(digits.parse::<i64>().unwrap_or(30).min(JOURS_MAX))
+}
+
+pub(crate) fn instant_de(
+    input: &str,
+    maintenant: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    let brut = input.trim();
+    if let Some(jours) = jours_relatifs(brut) {
+        return Some(maintenant - chrono::Duration::days(jours));
+    }
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(brut) {
+        return Some(d.with_timezone(&chrono::Utc));
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+    ] {
+        if let Ok(d) = chrono::NaiveDateTime::parse_from_str(brut, format) {
+            return Some(d.and_utc());
+        }
+    }
+    chrono::NaiveDate::parse_from_str(brut, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|d| d.and_utc())
+}
+
+/// Une date de règle en secondes depuis l'époque : la forme de
+/// `tracks.file_mtime` (REAL sur SQLite, DOUBLE PRECISION sur PostgreSQL).
+/// `None` si la date est illisible — l'appelant pose alors une condition
+/// FAUSSE.
+pub(crate) fn horodatage_epoch(input: &str) -> Option<i64> {
+    instant_de(input, chrono::Utc::now()).map(|d| d.timestamp())
+}
+
+/// Les deux bornes d'une règle « entre » sur `file_mtime`, en secondes. Même
+/// lecture que [`bornes_de_dates`] ; `None` si la valeur n'est pas un tableau
+/// ou si une borne est illisible.
+pub(crate) fn bornes_epoch(valeur: Option<&serde_json::Value>) -> Option<(i64, i64)> {
+    let arr = valeur?.as_array()?;
+    let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
+    let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
+    Some((horodatage_epoch(lo)?, horodatage_epoch(hi)?))
+}
+
+/// Une date de règle en SQL TEXTE, pour `listen_history.listened_at` (ISO
+/// 8601 sur les deux moteurs) : une forme relative devient le littéral ISO
+/// d'« il y a N jours » (#6143, plus de `DATETIME('now', …)`) ; tout le reste
+/// est une date littérale, comparée telle quelle.
+///
+/// Sortie de `smart_collections` (#5547), pour que les playlists lisent une
+/// date comme les collections.
+pub(crate) fn horodatage_sql(input: &str) -> String {
+    if let Some(jours) = jours_relatifs(input) {
+        let d = chrono::Utc::now() - chrono::Duration::days(jours);
+        return format!("'{}'", d.format("%Y-%m-%dT%H:%M:%SZ"));
     }
     format!("'{}'", input.replace('\'', "''"))
 }

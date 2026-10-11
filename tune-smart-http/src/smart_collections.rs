@@ -774,32 +774,33 @@ pub fn build_album_query(
 
         // --- added_at / last_played_at use timestamp logic ---
         if field == "added_at" {
-            let ts = resolve_timestamp_sql(&value);
+            // #6143 — la borne est calculée en Rust, en secondes, et comparée
+            // telle quelle à `file_mtime` : plus de `DATETIME(…, 'unixepoch')`
+            // ni de `DATETIME('now', …)`, propres à SQLite (PostgreSQL les
+            // refuse et l'aperçu tombait). Une date illisible ne retient rien.
+            //
             // NB: "greater_than"/"less_than" normalize to ">="/"<=" above, so
             // both spellings must be matched here — the seeded "🆕 Récents"
             // (added_at greater_than 90d) used to fall through `_ => continue`,
             // dropping its only rule and matching the ENTIRE library.
             let cond = match op {
-                ">" | ">=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
-                "<" | "<=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
+                ">" | ">=" | "<" | "<=" => match crate::regles_sql::horodatage_epoch(&value) {
+                    Some(ts) => format!(
+                        "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                         WHERE t2.file_mtime {op} {ts})"
+                    ),
+                    None => crate::regles_sql::FAUX.to_string(),
+                },
                 "between" => {
-                    if let Some(arr) = value_raw.and_then(|v| v.as_array()) {
-                        let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
-                        let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
-                        let lo_sql = resolve_timestamp_sql(lo);
-                        let hi_sql = resolve_timestamp_sql(hi);
-                        format!(
-                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                             WHERE DATETIME(t2.file_mtime, 'unixepoch') BETWEEN {lo_sql} AND {hi_sql})"
-                        )
-                    } else {
+                    if value_raw.and_then(|v| v.as_array()).is_none() {
                         continue;
+                    }
+                    match crate::regles_sql::bornes_epoch(value_raw) {
+                        Some((lo, hi)) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime BETWEEN {lo} AND {hi})"
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
                 // #5547 — « jamais » : l'éditeur le propose pour toute date,
@@ -1637,14 +1638,50 @@ mod tests {
     #[test]
     fn resolve_timestamp_relative_forms() {
         // "now-Nd" (editor form) and bare "Nd" (seeded "🆕 Récents") are both
-        // N-days-ago; anything else stays a quoted literal.
-        assert_eq!(
-            resolve_timestamp_sql("now-30d"),
-            "DATETIME('now', '-30 days')"
-        );
-        assert_eq!(resolve_timestamp_sql("90d"), "DATETIME('now', '-90 days')");
-        assert_eq!(resolve_timestamp_sql("90"), "DATETIME('now', '-90 days')");
+        // N-days-ago — désormais un littéral ISO calculé en Rust (#6143) ;
+        // anything else stays a quoted literal.
+        let attendu = |jours: i64| {
+            let d = chrono::Utc::now() - chrono::Duration::days(jours);
+            format!("'{}'", d.format("%Y-%m-%d"))
+        };
+        for (forme, jours) in [("now-30d", 30), ("90d", 90), ("90", 90)] {
+            let sql = resolve_timestamp_sql(forme);
+            assert!(
+                sql.starts_with(&attendu(jours)[..11]) && sql.ends_with("Z'"),
+                "{forme} → {sql}"
+            );
+            assert!(!sql.contains("DATETIME"), "{forme} → {sql}");
+        }
         assert_eq!(resolve_timestamp_sql("2024-01-01"), "'2024-01-01'");
+    }
+
+    /// #6143 — aucune règle de date ne compile en `DATETIME(…)`, fonction
+    /// propre à SQLite que PostgreSQL refuse.
+    #[test]
+    fn regles_de_date_sans_datetime_6143() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for champ in ["added_at", "last_played_at"] {
+            for (op, valeur) in [
+                ("greater_than", r#""2024-01-01""#),
+                ("less_than", r#""2024-01-01""#),
+                (">", r#""now-90d""#),
+                ("<", r#""90d""#),
+                ("between", r#"["2018-01-01","now-30d"]"#),
+            ] {
+                let rules =
+                    format!(r#"[{{"field":"{champ}","operator":"{op}","value":{valeur}}}]"#);
+                let (where_clause, _, _) =
+                    build_album_query(&rules, "all", "title", "asc", None, &ctx);
+                assert!(
+                    !where_clause.to_uppercase().contains("DATETIME"),
+                    "{champ} {op} {valeur} compile encore en DATETIME (#6143) : {where_clause}"
+                );
+                assert!(
+                    !where_clause.is_empty(),
+                    "{champ} {op} {valeur} : règle perdue"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1656,7 +1693,7 @@ mod tests {
         let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
         let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(
-            where_clause.contains("DATETIME('now', '-90 days')"),
+            where_clause.contains("t2.file_mtime >= "),
             "added_at rule must compile: {where_clause}"
         );
         assert!(where_clause.contains(">="));
