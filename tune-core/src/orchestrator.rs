@@ -425,12 +425,17 @@ fn spawn_paced_levels_forwarder_mesure(
             // sortie locale et en DoP : rien n'y est raboté.
             let gain_demande_units = playback.gain_demande_units(zone_id);
             let gain = gain_units as f64 / 1000.0;
-            let mut lvl = crate::audio::levels::compute_levels_avec_gain(
+            // #4969 — la carte des canaux de la sortie locale : les niveaux
+            // par canal décrivent alors les voies qui SORTENT (réaffectation
+            // #6044, disposition déclarée #6057), pas l'ordre du fichier.
+            let carte = playback.carte_des_canaux(zone_id);
+            let mut lvl = crate::audio::levels::compute_levels_vers_la_sortie(
                 &pcm,
                 raw.bit_depth,
                 raw.channels,
                 raw.sample_rate,
                 gain,
+                carte.as_ref(),
             );
             // #4384 — la CRÊTE, elle, se lit sur les échantillons tels qu'ils
             // partent vers le DAC quand la sortie locale les a relevés : après
@@ -455,8 +460,7 @@ fn spawn_paced_levels_forwarder_mesure(
             bus.emit(
                 "playback.audio_levels",
                 avec_les_niveaux_par_canal(
-                    &lvl.canaux,
-                    raw.channels,
+                    &lvl,
                     avec_le_gain_demande(
                         gain_demande_units,
                         serde_json::json!({
@@ -592,10 +596,14 @@ fn avec_le_gain_demande(
 }
 
 /// #4969 — champs ADDITIFS de `playback.audio_levels`, posés seulement à partir
-/// de trois canaux : `channel_levels`, le niveau de chaque canal dans l'ordre
-/// du flux (`rms_db`, `peak_db`, `over`), et `channel_names`, le nom de chaque
-/// canal dans l'ordre par défaut FLAC/WAV quand il en existe un (voir
-/// [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+/// de trois canaux : `channel_levels`, le niveau de chaque canal (`rms_db`,
+/// `peak_db`, `over`), et `channel_names`, le nom de chaque canal quand il en
+/// existe un (voir [`crate::audio::levels::noms_des_canaux_par_defaut`]).
+///
+/// Sur une sortie locale branchée, ces canaux sont ceux du PÉRIPHÉRIQUE,
+/// après réaffectation (#6044) et routage par la disposition déclarée
+/// (#6057), et `output_channels` en donne le nombre ; un repli vers la
+/// stéréo n'en pose aucun. Ailleurs, ils suivent l'ordre de la source.
 ///
 /// En stéréo rien ne change : un client ancien, application iOS comprise, ne
 /// voit aucun champ de plus, et un client neuf se garde de leur absence.
@@ -603,15 +611,14 @@ fn avec_le_gain_demande(
 /// rendu réseau qui replie la piste en stéréo (#4573), il n'a plus que deux
 /// canaux, et ces champs restent absents.
 fn avec_les_niveaux_par_canal(
-    canaux: &[crate::audio::levels::NiveauDeCanal],
-    channels: u16,
+    lvl: &crate::audio::levels::AudioLevels,
     mut niveaux: serde_json::Value,
 ) -> serde_json::Value {
-    if canaux.is_empty() {
+    if lvl.canaux.is_empty() {
         return niveaux;
     }
     niveaux["channel_levels"] = serde_json::Value::Array(
-        canaux
+        lvl.canaux
             .iter()
             .map(|c| {
                 serde_json::json!({
@@ -622,8 +629,11 @@ fn avec_les_niveaux_par_canal(
             })
             .collect(),
     );
-    if let Some(noms) = crate::audio::levels::noms_des_canaux_par_defaut(channels) {
+    if let Some(noms) = lvl.noms_des_canaux {
         niveaux["channel_names"] = serde_json::json!(noms);
+    }
+    if let Some(sorties) = lvl.canaux_de_sortie {
+        niveaux["output_channels"] = serde_json::json!(sorties);
     }
     niveaux
 }
@@ -1228,6 +1238,13 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     annonces_navigateur: std::sync::Mutex<HashMap<i64, AnnonceNavigateurDifferee>>,
+    /// #6066 — ce que les LECTEURS des zones navigateur ont dit de leur
+    /// lecture (`POST /zones/{id}/browser-playing`). Voir
+    /// `confirmation_navigateur_6066`.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    confirmations_du_lecteur:
+        std::sync::Mutex<confirmation_navigateur_6066::ConfirmationsDuLecteur>,
     /// Dernier repli de PÉRIPHÉRIQUE local annoncé par zone, texte compris
     /// (#2269).
     ///
@@ -1281,6 +1298,9 @@ pub struct PlaybackOrchestrator {
     pub(crate) sources_physiques: Arc<crate::sources_physiques::RegistreSources>,
     /// #5662 — les files de volume par (sortie, zone) : voir `volume_coalescent`.
     pub(crate) volume_coalesceur: volume_coalescent::CoalesceurDeVolume,
+    /// #2264 — la mémoire de la règle de version : choix explicites en
+    /// attente, réponses des services. Voir `version_de_lecture`.
+    pub(crate) versions: version_de_lecture::EtatDesVersions,
 }
 
 /// Ce qu'il faut pour annoncer une écoute de zone navigateur PLUS TARD, une
@@ -1640,6 +1660,7 @@ impl PlaybackOrchestrator {
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
+            confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1648,6 +1669,7 @@ impl PlaybackOrchestrator {
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
+            versions: Default::default(),
         }
     }
 
@@ -1708,6 +1730,8 @@ impl PlaybackOrchestrator {
 }
 
 mod commun;
+mod confirmation_navigateur_6066;
+pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
@@ -1762,6 +1786,8 @@ mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
 mod resolve_direct;
+/// #2264 — la règle de version appliquée à la lecture.
+mod version_de_lecture;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
 mod capacite_lpcm_par_sortie;
 // #4863 — une source PCM fournie par un greffon (lecture d'un CD).
@@ -1952,6 +1978,10 @@ mod niveaux_frein_3818;
 /// #4969 — un flux multicanal publie le niveau de chaque canal.
 #[cfg(test)]
 mod niveaux_par_canal_4969;
+/// #4969 — les niveaux par canal suivent les voies qui SORTENT : un vrai WAV
+/// 5.1, un canal à la fois, à travers réaffectation et disposition.
+#[cfg(test)]
+mod niveaux_par_canal_de_sortie_4969;
 #[cfg(test)]
 mod niveaux_relais_unique_5078_5051;
 #[cfg(test)]
@@ -1960,6 +1990,9 @@ mod niveaux_source_pcm_5078;
 mod resolution_annoncee_tests;
 #[cfg(test)]
 mod saut_de_piste_pcm_5079;
+/// #6018 — un titre Spotify joué par librespot, jusqu'à la session de la zone.
+#[cfg(all(test, unix))]
+mod spotify_6018_tests;
 
 /// #2250 — « Lire » et « Lecture aléatoire » annoncent la MÊME résolution pour
 /// la même ligne. La garde voisine (`resolution_annoncee_tests`) éprouve la
@@ -2053,6 +2086,10 @@ mod reprise_dlna_position_2095;
 /// ait ouvert le flux.
 #[cfg(test)]
 mod reprise_renderer_cale_2125;
+/// #6017 — fil 2194 : avancer dans une piste de la bibliothèque convertie à
+/// la volée recrée le flux à la position au lieu d'un `Seek` SOAP refusé.
+#[cfg(test)]
+mod seek_bibliotheque_sans_range_6017;
 /// #5476 — une commande de l'utilisateur arrivée après une reprise rend caduc
 /// le Seek de reprise détaché.
 #[cfg(test)]
