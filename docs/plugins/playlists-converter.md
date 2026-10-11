@@ -17,7 +17,8 @@ paquet publié (archives, installeur Windows, `.app`, image Docker), sous
 `Feature::PluginMarketplace`, posée par l'hôte) et `enable`/`install`/`update`
 aussi, comme pour les greffons audio payants. **Exception** (Bertrand,
 08/10/2026) : les copies datées (`/snapshot`, `/snapshots`,
-`/snapshot/restauration/apercu`, `/snapshot/restauration`) restent
+`/snapshot/restauration/apercu`, `/snapshot/restauration`, et
+`/snapshot/supprimer` depuis le 11/10) restent
 **gratuites**, parce qu'elles portent les sauvegardes de playlists de l'écran
 v2. La liste est tenue par l'hôte (`ROUTES_GRATUITES`, `routes/plugins.rs`). Il peut encore s'installer depuis
 la boutique de mozaiklabs.fr, dès que sa fiche y est publiée (payante : un
@@ -105,6 +106,7 @@ aucune licence.
 | `GET /snapshot?id=snap-K-N` | — | `{snapshot: {…en-tête, pistes: [{id, titre, artiste, duree_ms, isrc}]}}` ; `404` inconnu ou expiré |
 | `POST /snapshot/restauration/apercu` | `{snapshot_id, mode: "completer"\|"recreer"}` | `{plan, a_rajouter: [piste…], a_retirer_par_vous: [piste…], introuvables: [piste…]}` — **rien n'est écrit** |
 | `POST /snapshot/restauration` | `{plan_id, accord: true}` | `{plan, a_retirer_par_vous}` ; `409` sans accord ou plan déjà exécuté |
+| `POST /snapshot/supprimer` | `{snapshot_id}` | `{snapshot_id, supprime: true, playlists_touchees: false}` ; `400` si l'identifiant n'est pas `snap-K-N` (un chemin, une autre clé) ; `404` inconnu, expiré ou déjà supprimé |
 
 | `POST /liens` | `{a: {service, playlist_id}, b: {service, playlist_id}, sens?: "a_vers_b"\|"deux_sens", cadence_minutes?}` | `{lien}` — état `attente_premier_apercu` ; `400` si même service, cadence hors bornes ou playlist illisible |
 | `GET /liens` | — | `{count, liens: [lien…]}` (supprimés exclus) |
@@ -169,6 +171,12 @@ est un **anneau**.
 * Les pistes sont rangées par pages de 400, pour tenir sous la borne de
   256 Kio par valeur.
 * **20 plans de retour en arrière** gardés, tous confondus.
+* **Supprimer une copie** (Bertrand, 08/10/2026, #5966) : `POST
+  /snapshot/supprimer` réécrit son en-tête et ses pages à `null`. Son contenu
+  ne se relit plus, elle sort des listes, et une playlist qui n'a plus aucune
+  copie sort de `GET /snapshots`. L'emplacement reste à l'anneau. Aucune
+  capacité de suppression n'est ajoutée à l'hôte, et ni la playlist ni les
+  autres copies ne sont touchées.
 
 ## Liens auto-sync (#4719)
 

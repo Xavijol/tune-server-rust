@@ -12,7 +12,7 @@
 //! | `POST /playlist-manager/backup` | `POST /snapshot` (une playlist à la fois) |
 //! | `GET /playlist-manager/backups[/{id}]` | `GET /snapshots`, `GET /snapshot?id=` |
 //! | `POST /playlist-manager/backups/{id}/restore` | `POST /snapshot/restauration/apercu`, puis `/snapshot/restauration` |
-//! | `DELETE /playlist-manager/backups/{id}` | aucune : le greffon garde un anneau de 10 copies par playlist |
+//! | `DELETE /playlist-manager/backups/{id}` | `POST /snapshot/supprimer` (une copie à la fois) |
 //!
 //! Les clients livrés (web, appli iPad, appli Flutter) passent désormais par
 //! le greffon. Ces alias ne restent que pour les ANCIENS clients : ils

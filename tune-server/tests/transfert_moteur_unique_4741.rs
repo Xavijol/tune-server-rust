@@ -829,3 +829,89 @@ async fn les_liens_du_greffon_restent_premium_5966() {
     let (st, refus) = appel(&b.app, "GET", &format!("{BASE_GREFFON}/liens"), Value::Null).await;
     assert_eq!(st, StatusCode::PAYMENT_REQUIRED, "{refus}");
 }
+
+/// Supprimer une copie datée depuis le greffon (décision de Bertrand du
+/// 08/10/2026, #5966), par le vrai `main.wasm` et le vrai routeur :
+///
+/// - c'est gratuit, comme les copies elles-mêmes ;
+/// - la copie disparaît de la liste et ne se relit plus ;
+/// - un identifiant qui n'est pas celui d'une copie (`..`, une autre clé du
+///   stockage du greffon) est refusé en 400, sans rien effacer ;
+/// - rien n'est écrit chez un service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn supprimer_une_copie_datee_est_gratuit_et_borne_aux_copies_5966() {
+    let _verrou = crate::lock_environment();
+    let b = banc_licence(true, false).await;
+    let (st, rendu) = appel(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot"),
+        json!({ "service": "source", "playlist_id": "pl-1" }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rendu}");
+    let snapshot_id = rendu["snapshot"]["snapshot_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for intrus in [
+        "..",
+        "../compteur_playlists_snap",
+        "snap:1:0",
+        "snap-1-1/..",
+    ] {
+        let (st, refus) = appel(
+            &b.app,
+            "POST",
+            &format!("{BASE_GREFFON}/snapshot/supprimer"),
+            json!({ "snapshot_id": intrus }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "`{intrus}` : {refus}");
+    }
+    let (st, intacte) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshot?id={snapshot_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "un refus n'efface rien : {intacte}");
+
+    let (st, fait) = appel(
+        &b.app,
+        "POST",
+        &format!("{BASE_GREFFON}/snapshot/supprimer"),
+        json!({ "snapshot_id": snapshot_id }),
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "supprimer une copie est refusé à un compte gratuit : {fait}"
+    );
+    assert_eq!(fait["supprime"], true, "{fait}");
+
+    let (st, _) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshot?id={snapshot_id}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    let (st, liste) = appel(
+        &b.app,
+        "GET",
+        &format!("{BASE_GREFFON}/snapshots"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{liste}");
+    assert_eq!(liste["count"], 0, "{liste}");
+    assert!(
+        journal(&b.ecritures_source).is_empty() && journal(&b.ecritures_cible).is_empty(),
+        "supprimer une copie n'écrit rien chez un service"
+    );
+}
