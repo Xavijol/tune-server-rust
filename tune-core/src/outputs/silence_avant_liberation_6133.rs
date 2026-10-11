@@ -120,12 +120,12 @@ mod tests {
                     while pilote.tourne.load(Ordering::Acquire) {
                         index ^= 1;
                         let mut rappel = pilote.rappel.lock().unwrap();
-                        if let Some(rappel) = rappel.as_mut() {
-                            if pilote.en_lecture.load(Ordering::Acquire) {
-                                let mut bloc = vec![0; TRAMES];
-                                rappel(&mut bloc);
-                                pilote.moities.lock().unwrap()[index] = bloc;
-                            }
+                        if let Some(rappel) = rappel.as_mut()
+                            && pilote.en_lecture.load(Ordering::Acquire)
+                        {
+                            let mut bloc = vec![0; TRAMES];
+                            rappel(&mut bloc);
+                            pilote.moities.lock().unwrap()[index] = bloc;
                         }
                         drop(rappel);
                         std::thread::sleep(Duration::from_millis(2));
