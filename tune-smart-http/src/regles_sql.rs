@@ -70,7 +70,14 @@ pub(crate) fn colonne_piste(champ: &str) -> Option<Colonne> {
         "title" | "track_title" => texte("t.title"),
         "artist" | "artist_name" => texte("ar.name"),
         "album" | "album_title" => texte("al.title"),
-        "album_artist" => texte("t.album_artist"),
+        // #6121 (forum 2218) — la balise ALBUMARTIST de la piste, et à
+        // défaut l'artiste de son ALBUM : une piste sans la balise appartient
+        // quand même à l'album de quelqu'un. `ar` est ici l'interprète de la
+        // piste (`t.artist_id`), d'où la sous-requête sur `al.artist_id`.
+        "album_artist" => texte(
+            "COALESCE(NULLIF(t.album_artist, ''), \
+             (SELECT aal.name FROM artists aal WHERE aal.id = al.artist_id))",
+        ),
         "genre" => texte("t.genre"),
         // 🔴 Le champ que l'éditeur proposait et que le moteur ignorait
         // ENTIÈREMENT : neuf opérateurs, aucun bras.
