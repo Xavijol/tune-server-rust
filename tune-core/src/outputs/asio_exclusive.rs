@@ -25,6 +25,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use tracing::{debug, info, warn};
 
 use super::local::{NativePcmRing, RingBuf};
+use super::silence_avant_liberation_6133::{
+    BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation,
+};
 use super::traits::RingStarvation;
 
 #[derive(Default)]
@@ -179,6 +182,10 @@ pub struct AsioExclusiveOutput {
     /// Kept alive for the render callback closure.
     #[allow(dead_code)]
     paused: Arc<AtomicBool>,
+    /// #6133 — silence de libération : `release()` l'arme et attend que le
+    /// rappel ait écrit des zéros dans les deux moitiés du double tampon avant
+    /// de mettre le flux en pause.
+    silence: Arc<SilenceAvantLiberation>,
     counters: Arc<RealtimeCounters>,
     /// Le périphérique cpal, gardé pour relire la cadence du pilote après la
     /// libération (#4184, piste 2b). Déclaré APRÈS `stream` : il lui survit.
@@ -365,6 +372,7 @@ impl AsioExclusiveOutput {
         // directly. Only incompatible configurations retain the processed
         // f32 path, with an explicit reason logged above.
         let counters = Arc::new(RealtimeCounters::default());
+        let silence = Arc::new(SilenceAvantLiberation::default());
         let stream = Self::build_native_stream(
             &device,
             &stream_config,
@@ -373,6 +381,7 @@ impl AsioExclusiveOutput {
             native_ring.clone(),
             volume.clone(),
             paused.clone(),
+            silence.clone(),
             counters.clone(),
         )?;
 
@@ -436,6 +445,7 @@ impl AsioExclusiveOutput {
             transport,
             volume,
             paused,
+            silence,
             counters,
             device_guard,
         })
@@ -513,11 +523,35 @@ impl AsioExclusiveOutput {
     pub fn release(&mut self) -> Result<(), String> {
         // Stop and drop the stream
         if let Some(stream) = self.stream.take() {
-            if let Err(e) = stream.pause() {
-                warn!(error = %e, "asio_exclusive_pause_failed");
+            // #6133 — taire AVANT de mettre en pause. cpal, au `pause()`, ne
+            // réécrit plus le double tampon ASIO, et le pilote rejoue ce qu'il
+            // contient jusqu'à `ASIOStop`, soit toute l'attente de libération
+            // (`teardown_settle_for`). Sans ce silence, c'est le dernier bloc
+            // de musique qui tournait en boucle : un bourdonnement à l'arrêt.
+            let confirme = self
+                .silence
+                .taire_puis_liberer(BORNE_SILENCE_AVANT_LIBERATION, || {
+                    if let Err(e) = stream.pause() {
+                        warn!(error = %e, "asio_exclusive_pause_failed");
+                    }
+                    // Stream is dropped here, releasing the ASIO device
+                    drop(stream);
+                });
+            if confirme {
+                debug!(
+                    device = %self.device_name,
+                    blocs_muets = self.silence.blocs_muets(),
+                    "asio_exclusive_silence_avant_liberation"
+                );
+            } else {
+                warn!(
+                    device = %self.device_name,
+                    blocs_muets = self.silence.blocs_muets(),
+                    borne_ms = BORNE_SILENCE_AVANT_LIBERATION.as_millis() as u64,
+                    "asio_exclusive_silence_avant_liberation_non_confirme — le pilote n'a pas \
+                     rappelé assez tôt : le double tampon peut encore contenir de l'audio"
+                );
             }
-            // Stream is dropped here, releasing the ASIO device
-            drop(stream);
         }
 
         // Log restoration info (ASIO drivers typically restore their state
@@ -610,6 +644,7 @@ impl AsioExclusiveOutput {
         native_ring: Arc<NativePcmRing>,
         volume: Arc<AtomicU32>,
         paused: Arc<AtomicBool>,
+        silence: Arc<SilenceAvantLiberation>,
         counters: Arc<RealtimeCounters>,
     ) -> Result<cpal::Stream, String> {
         match transport {
@@ -620,7 +655,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(0);
                                 return;
                             }
@@ -644,7 +679,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(I24_ZERO);
                                 return;
                             }
@@ -669,7 +704,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(0);
                                 return;
                             }
@@ -692,7 +727,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(0);
                                 return;
                             }
@@ -722,7 +757,7 @@ impl AsioExclusiveOutput {
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
                             let zero = I24_ZERO;
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(zero);
                                 return;
                             }
@@ -752,7 +787,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(0);
                                 return;
                             }
@@ -781,7 +816,7 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            if paused.load(Ordering::Relaxed) {
+                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
                                 data.fill(0.0);
                                 return;
                             }
