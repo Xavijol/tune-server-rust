@@ -132,7 +132,14 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("track_number", Famille::Nombre),
     deux("disc_number", Famille::Nombre),
     deux("bpm", Famille::Nombre),
+    // « Note de l'album » : la note de l'album pour le profil actif (#5547).
+    // Le nom `rating` est celui des règles déjà enregistrées : il garde ce
+    // sens-là (décision de Bertrand du 11/10, #6123).
     deux("rating", Famille::Nombre),
+    // « Note de la piste » (#6123) : la note lue dans les balises du fichier
+    // (`tracks.rating`, 0 à 5, sans profil). Dans une collection : un album
+    // dont UNE piste au moins passe la comparaison.
+    deux("track_rating", Famille::Nombre),
     deux("cover_path", Famille::Vide),
     deux("added_at", Famille::Horodatage),
     deux("credit", Famille::Credit),
@@ -364,6 +371,34 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// #6123 — « note de la piste » lit `tracks.rating`, des deux côtés ; et
+    /// « note de l'album » (`rating`) garde son sens, même quand les pistes
+    /// portent une note.
+    ///
+    /// Notes de piste posées ici : 1 → 4, 2 → 1, 3 → 5, 4 aucune.
+    #[test]
+    fn la_note_de_la_piste_marche_des_deux_cotes_6123() {
+        let db = bibliotheque();
+        db.execute_batch(
+            "UPDATE tracks SET rating = 4 WHERE id = 1; \
+             UPDATE tracks SET rating = 1 WHERE id = 2; \
+             UPDATE tracks SET rating = 5 WHERE id = 3;",
+        )
+        .unwrap();
+        let r = |op: &str, v: Value| regle("track_rating", op, v);
+        assert_eq!(pistes(&db, &r(">=", json!(4))), vec![1, 3]);
+        assert_eq!(pistes(&db, &r("<", json!(2))), vec![2]);
+        assert_eq!(pistes(&db, &r("=", json!("5"))), vec![3]);
+        // Une piste sans note ne passe aucune comparaison.
+        assert_eq!(pistes(&db, &r("between", json!([0, 5]))), vec![1, 2, 3]);
+        // Collections : l'album dont une piste passe.
+        assert_eq!(albums(&db, &r(">=", json!(4))), vec![1, 2]);
+        assert_eq!(albums(&db, &r("<", json!(2))), vec![1]);
+        // La note de l'ALBUM n'a pas bougé : Kind of Blue 5, Giant Steps 2.
+        assert_eq!(pistes(&db, &regle("rating", ">=", json!(4))), vec![1, 2]);
+        assert_eq!(albums(&db, &regle("rating", ">=", json!(4))), vec![1]);
+    }
+
     #[test]
     fn la_note_est_celle_du_profil_actif() {
         let db = bibliotheque();
@@ -421,15 +456,15 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : vingt-neuf définitions, dont vingt-sept aux
-    /// collections (#5530 : « Généré par IA »). Si ce nombre bouge,
-    /// `smartRegles.ts` doit bouger aussi.
+    /// Le compte du client : trente définitions, dont vingt-huit aux
+    /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la
+    /// piste »). Si ce nombre bouge, `smartRegles.ts` doit bouger aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 29);
+        assert_eq!(CRITERES.len(), 30);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            27
+            28
         );
     }
 

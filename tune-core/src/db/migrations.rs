@@ -2431,6 +2431,28 @@ CREATE TABLE IF NOT EXISTS album_preferred_roots (
         name: "queue_items_artist_ref",
         up: "",
     },
+    // #6123 (forum-hifi #792, PhilActiveAudio75) — la NOTE de la piste lue
+    // dans ses balises (Vorbis `RATING`, ID3 `POPM` / `TXXX:RATING`, MP4
+    // `rate`, FMPS), ramenée sur 0 à 5 : `tracks.rating`. Sans profil : c'est
+    // la note du fichier ; la note par profil reste celle de l'album
+    // (`album_ratings`), inchangée. Décision de Bertrand du 11/10.
+    //
+    // NULL pour toutes les lignes existantes : la note arrive au prochain
+    // scan qui récrit la ligne (« Scan complet », ou fichier modifié).
+    //
+    // Numérotée 124 / PG 088 : la 123 / PG 087 (#6079) est la dernière sur
+    // `batch/bugs-rc4-20261008` le 11/10, et aucune PR ouverte ne touche aux
+    // migrations. Le lanceur ne joue que `version > MAX` : elle vient APRÈS
+    // la 123.
+    //
+    // Colonne posée par `add_column_if_missing` dans le bloc de version et
+    // dans la passe finale, PAS dans `up` : même règle qu'à la 114 — l'INSERT
+    // et l'UPDATE des pistes la NOMMENT. Jumelle PG : 088.
+    Migration {
+        version: 124,
+        name: "tracks_rating",
+        up: "",
+    },
 ];
 
 /// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
@@ -3636,6 +3658,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // défaut : NULL = INCONNU pour toute ligne existante.
             add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
         }
+        if migration.version == 124 {
+            // La note de la piste lue dans ses balises (#6123). Sans défaut :
+            // NULL = le fichier n'en porte pas, ou pas encore relu.
+            add_column_if_missing(db, "tracks", "rating", "INTEGER");
+        }
         if migration.version == 109 {
             // #4889 — titres de service dans les playlists Tune. Erreur
             // RENDUE : la version n'est pas enregistree, on reessaie au
@@ -4175,6 +4202,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #6079) — posé ICI aussi : l'écriture de la file le NOMME, et une base
     // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 087.
     add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
+    // La note de la piste (migration 124, #6123) — posée ICI aussi : l'INSERT
+    // et l'UPDATE des pistes la NOMMENT, et une base arrivée sans elle ne
+    // pourrait plus rien scanner. PG : migration 088.
+    add_column_if_missing(db, "tracks", "rating", "INTEGER");
     // Index de `listen_history.album_id` (migration 115, fil 2130) — posé ICI
     // aussi : une base arrivée sans lui reste juste, mais « Reprendre
     // l'écoute » y redevient lent. PG : migration 079.
@@ -5013,6 +5044,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         87,
         "queue_items_artist_ref",
         include_str!("../../migrations/postgres/087_queue_items_artist_ref.sql"),
+    ),
+    // Jumelle de la SQLite 124 (#6123) : `tracks.rating`, la note de la piste
+    // lue dans ses balises (0 à 5), NULL pour l'existant.
+    (
+        88,
+        "tracks_rating",
+        include_str!("../../migrations/postgres/088_tracks_rating.sql"),
     ),
 ];
 
@@ -7023,6 +7061,105 @@ mod tests {
         );
     }
 
+    /// #6123 — la migration 124 pose `tracks.rating` (la note de la piste lue
+    /// dans ses balises), sur une base NEUVE comme sur une base MONTÉE en 123
+    /// avec une piste ; la colonne est NULLABLE et l'existant reste NULL ; la
+    /// jumelle PG 088 existe, est enregistrée, marque le bon numéro, convertit
+    /// une colonne TEXT de bascule, et le schéma de bascule comme
+    /// `ENSURE_COLUMNS` la portent.
+    #[test]
+    fn la_migration_124_pose_la_note_de_la_piste_6123() {
+        let colonne = |db: &SqliteDb| -> Option<(String, bool)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(tracks)").unwrap();
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })
+                .unwrap();
+            rows.map(|r| r.unwrap())
+                .find(|(nom, _, _)| nom == "rating")
+                .map(|(_, ty, non_nul)| (ty, non_nul != 0))
+        };
+        let attendu = Some(("INTEGER".to_string(), false));
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(
+            colonne(&neuve),
+            attendu,
+            "base neuve : `tracks.rating` doit exister, INTEGER et nullable"
+        );
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "ALTER TABLE tracks DROP COLUMN rating;
+                 DELETE FROM _migrations WHERE version >= 124;
+                 INSERT INTO tracks (title, file_path) VALUES ('Piste', '/m/a.flac');",
+            )
+            .unwrap();
+        assert_eq!(colonne(&montee), None, "préparation : colonne retirée");
+        assert_eq!(current_version(&montee).unwrap(), 123);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 124);
+        assert_eq!(
+            colonne(&montee),
+            attendu,
+            "base montée : `tracks.rating` doit exister, INTEGER et nullable"
+        );
+        {
+            let conn = montee.connection().lock().unwrap();
+            let (lignes, notees): (i64, i64) = conn
+                .query_row("SELECT COUNT(*), COUNT(rating) FROM tracks", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(
+                (lignes, notees),
+                (1, 0),
+                "la piste survit, sans note inventée"
+            );
+        }
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "088_tracks_rating.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (88, 'tracks_rating')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        assert!(
+            sql_pg.contains("ADD COLUMN IF NOT EXISTS rating BIGINT")
+                && sql_pg.contains("TYPE BIGINT USING"),
+            "la jumelle PG ne pose pas `tracks.rating` en BIGINT, ou ne convertit pas la \
+             colonne TEXT d'une bascule"
+        );
+        assert!(
+            include_str!("migrations.rs").contains(fichier),
+            "{fichier} n'est pas enregistrée"
+        );
+        assert!(
+            include_str!("pg_migrate.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT"),
+            "pg_migrate.rs ne pose pas `tracks.rating`"
+        );
+        assert!(
+            include_str!("postgres.rs")
+                .contains("ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating BIGINT"),
+            "ENSURE_COLUMNS ne pose pas `tracks.rating`"
+        );
+    }
+
     /// #6079 — la migration 123 pose `queue_items.artist_ref` (l'artiste d'une
     /// piste de service chez son service), sur une base NEUVE comme sur une
     /// base MONTÉE en 122 avec une ligne ; la colonne est NULLABLE et
@@ -8104,7 +8241,9 @@ mod tests {
         // SQLite 122. Vient après la 85 de #5959.
         // 87 : `queue_items_artist_ref` (#6079), jumelle de la SQLite 123.
         // Pose `queue_items.artist_ref`, que l'écriture de la file NOMME.
-        assert_eq!(pg_latest_version(), 87, "latest PG migration must be 87");
+        // 88 : `tracks_rating` (#6123), jumelle de la SQLite 124. Pose
+        // `tracks.rating`, que l'INSERT et l'UPDATE des pistes NOMMENT.
+        assert_eq!(pg_latest_version(), 88, "latest PG migration must be 88");
         for wanted in [10, 11, 13, 36] {
             assert!(
                 PG_MIGRATIONS.iter().any(|&(v, _, _)| v == wanted),

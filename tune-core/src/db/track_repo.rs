@@ -677,8 +677,11 @@ pub mod sql {
         // no album_artist to key on and shows track 1's artist for compilations
         // whose files carry no ALBUMARTIST tag (Bilou). The column keeps its
         // position, so row parsing is unchanged.
+        //
+        // `t.rating` (#6123) ferme la liste, au rang 34 : une projection qui
+        // s'arrête avant rend `rating = None`, jamais un décalage.
         format!(
-            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms{}",
+            "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, COALESCE(NULLIF(t.album_artist, ''), aal.name), t.disc_number, t.disc_subtitle, t.track_number, t.duration_ms, t.file_path, t.format, t.sample_rate, t.bit_depth, t.channels, t.file_mtime, t.file_size, t.audio_hash, t.source, t.source_id, t.isrc, t.genre, t.composer, t.year, t.bpm, t.label, t.musicbrainz_recording_id, COALESCE(t.cover_path, al.cover_path), t.genres, t.comments, t.cue_media_path, t.cue_start_ms, t.cue_end_ms, t.rating{}",
             track_from()
         )
     }
@@ -735,11 +738,11 @@ pub mod sql {
         )
     }
 
-    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms";
+    const INSERT_COLS: &str = "title, album_id, artist_id, album_artist, disc_number, disc_subtitle, track_number, duration_ms, file_path, format, sample_rate, bit_depth, channels, file_mtime, file_size, audio_hash, source, source_id, isrc, genre, genres, composer, year, bpm, label, musicbrainz_recording_id, comments, cover_path, cue_media_path, cue_start_ms, cue_end_ms, rating";
 
     /// Combien de colonnes `INSERT_COLS` porte — la seule source de vérité du
     /// nombre de paramètres liés, pour les deux moteurs.
-    pub const NB_COLONNES_INSERT: usize = 31;
+    pub const NB_COLONNES_INSERT: usize = 32;
 
     pub fn insert<D: SqlDialect>(d: &D) -> String {
         let placeholders: Vec<String> =
@@ -774,8 +777,8 @@ pub mod sql {
     ];
 
     /// Le nombre de valeurs liées par [`update`] et [`update_du_scan`] : leurs
-    /// 25 colonnes, puis l'`id`.
-    pub const NB_PARAMS_UPDATE: usize = 26;
+    /// 26 colonnes, puis l'`id`.
+    pub const NB_PARAMS_UPDATE: usize = 27;
 
     /// `UPDATE tracks …` qui ÉCRASE tout, y compris ce que le scan ignore.
     ///
@@ -910,6 +913,17 @@ pub mod sql {
             // colonne n'était pas écrite du tout : ne rien effacer garde tout
             // ce qui marchait.
             garde(25, "isrc"),
+            // #6123 — la note de la piste. Le SCAN l'écrit telle que le
+            // fichier la dit : c'est sa SEULE source, une balise retirée puis
+            // rescannée doit retirer la note. Les autres écritures la GARDENT
+            // (`COALESCE`) : plusieurs reconstruisent la ligne sans la relire
+            // (réindexation UPnP, retouche d'une fiche), et effaceraient une
+            // note qu'elles ne connaissent pas.
+            if conserver {
+                brut(26, "rating")
+            } else {
+                format!("rating = COALESCE({}, rating)", d.placeholder(26))
+            },
         ];
         format!(
             "UPDATE tracks SET {} WHERE id = {}",
@@ -2178,6 +2192,7 @@ impl TrackRepo {
             &track.cue_media_path,
             &track.cue_start_ms,
             &track.cue_end_ms,
+            &track.rating,
         ];
         // Capture the new track id atomically, BEFORE the file_first_seen
         // insert below — otherwise `last_insert_rowid()` at the end returns that
@@ -2250,6 +2265,7 @@ impl TrackRepo {
             &track.musicbrainz_recording_id,
             &track.comments,
             &track.isrc,
+            &track.rating,
             &id,
         ];
         // #4546 : figer la date d'ajout AVANT que `file_mtime` ne soit récrit.
@@ -3477,6 +3493,7 @@ impl TrackRepo {
                 &track.cue_media_path,
                 &track.cue_start_ms,
                 &track.cue_end_ms,
+                &track.rating,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
         }
@@ -3640,6 +3657,7 @@ impl TrackRepo {
                 &track.musicbrainz_recording_id,
                 &track.comments,
                 &track.isrc,
+                &track.rating,
                 &id,
             ];
             row_params.push(params.iter().map(|p| p.to_sql_value()).collect());
@@ -4217,6 +4235,7 @@ fn row_to_track(cols: &Vec<SqlValue>) -> Track {
         cue_media_path: cols.get(31).and_then(|v| v.as_string()),
         cue_start_ms: cols.get(32).and_then(|v| v.as_i64()),
         cue_end_ms: cols.get(33).and_then(|v| v.as_i64()),
+        rating: cols.get(34).and_then(|v| v.as_i64()).map(|n| n as i32),
     }
 }
 
@@ -6425,7 +6444,8 @@ mod tests {
     }
 
     /// Les deux moteurs partagent le même texte : l'ISRC y est la 25e valeur
-    /// liée, l'`id` la 26e — pour SQLite comme pour PostgreSQL.
+    /// liée, la note la 26e (#6123), l'`id` la 27e — pour SQLite comme pour
+    /// PostgreSQL.
     #[test]
     fn le_sql_de_mise_a_jour_porte_l_isrc_sur_les_deux_moteurs_5463() {
         fn verifier<D: SqlDialect>(d: &D) {
@@ -6433,8 +6453,14 @@ mod tests {
                 let isrc = format!("isrc = COALESCE(NULLIF({}, ''), isrc)", d.placeholder(25));
                 assert!(sql.contains(&isrc), "{isrc} absent : {sql}");
                 assert!(
-                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(26))),
-                    "l'id doit être la 26e valeur : {sql}"
+                    sql.contains(&format!("rating = {}", d.placeholder(26)))
+                        || sql
+                            .contains(&format!("rating = COALESCE({}, rating)", d.placeholder(26))),
+                    "la note doit être la 26e valeur : {sql}"
+                );
+                assert!(
+                    sql.ends_with(&format!("WHERE id = {}", d.placeholder(27))),
+                    "l'id doit être la 27e valeur : {sql}"
                 );
             }
         }
@@ -6488,14 +6514,66 @@ mod tests {
             "ordre inversé : la valeur stockée serait figée pour toujours"
         );
         // Les paramètres restent à leur rang, dans les deux formes : 26
-        // depuis que `isrc` est écrit (#5463).
+        // depuis que `isrc` est écrit (#5463), 27 avec `rating` (#6123).
         for forme in [sql::update(&SqliteDialect), sql] {
             assert_eq!(
                 forme.matches('?').count(),
                 sql::NB_PARAMS_UPDATE,
-                "26 paramètres liés, ni plus ni moins : {forme}"
+                "27 paramètres liés, ni plus ni moins : {forme}"
             );
         }
+    }
+
+    /// #6123 — la note de la piste fait l'aller-retour par la base, et le
+    /// scan l'écrit telle que le fichier la dit, retrait compris ; une
+    /// écriture hors scan qui ne la connaît pas ne l'efface pas.
+    #[test]
+    fn la_note_de_la_piste_fait_l_aller_retour_6123() {
+        let db = test_db();
+        let repo = TrackRepo::new(db.clone());
+        let mut t = Track::new("Notée".into());
+        t.file_path = Some("/m/notee.flac".into());
+        t.rating = Some(4);
+        let id = repo.create(&t).unwrap();
+        let relue = |repo: &TrackRepo| repo.get(id).unwrap().unwrap().rating;
+        assert_eq!(
+            relue(&repo),
+            Some(4),
+            "la note n'est pas écrite à l'insertion"
+        );
+        assert_eq!(
+            repo.get(id).unwrap().unwrap().to_json()["rating"],
+            serde_json::json!(4),
+            "la note n'est pas exposée dans le JSON de la piste"
+        );
+
+        // Écriture hors scan, ligne reconstruite sans note : gardée.
+        let mut sans = Track::new("Notée".into());
+        sans.id = Some(id);
+        sans.file_path = t.file_path.clone();
+        repo.update(&sans).unwrap();
+        assert_eq!(
+            relue(&repo),
+            Some(4),
+            "une écriture hors scan a effacé la note"
+        );
+
+        // Le scan : la balise change la note, puis son retrait la retire.
+        let mut scan = sans.clone();
+        scan.rating = Some(2);
+        repo.update_batch(std::slice::from_ref(&scan)).unwrap();
+        assert_eq!(
+            relue(&repo),
+            Some(2),
+            "le scan n'a pas écrit la nouvelle note"
+        );
+        scan.rating = None;
+        repo.update_batch(std::slice::from_ref(&scan)).unwrap();
+        assert_eq!(
+            relue(&repo),
+            None,
+            "le scan a gardé une note que le fichier ne porte plus"
+        );
     }
 
     /// La forme PostgreSQL est la même règle, avec ses `$n` dans l'ordre.
@@ -6529,7 +6607,12 @@ mod tests {
             sql.contains("isrc = COALESCE(NULLIF($25, ''), isrc)"),
             "{sql}"
         );
-        assert!(sql.ends_with("WHERE id = $26"), "{sql}");
+        // #6123 — le scan écrit la note telle que le fichier la dit.
+        assert!(
+            sql.contains("rating = $26,") || sql.contains("rating = $26 "),
+            "{sql}"
+        );
+        assert!(sql.ends_with("WHERE id = $27"), "{sql}");
     }
 }
 

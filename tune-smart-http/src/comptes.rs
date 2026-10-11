@@ -52,7 +52,7 @@ pub const EVENEMENTS_QUI_INVALIDENT: [&str; 5] = [
 ///
 /// Liste BLANCHE : un champ absent d'ici — ou inconnu — rend la collection
 /// non cachable. Se tromper dans ce sens ne coûte qu'une requête.
-pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 19] = [
+pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 20] = [
     "genre",
     "artist",
     "artist_name",
@@ -72,6 +72,9 @@ pub const CHAMPS_DE_BIBLIOTHEQUE: [&str; 19] = [
     "track_number",
     "disc_number",
     "bpm",
+    // #6123 — lue dans les balises, elle ne change qu'avec la bibliothèque
+    // (le scan). `rating`, note d'album par profil, n'est PAS ici.
+    "track_rating",
 ];
 
 /// Vrai si toutes les règles portent sur [`CHAMPS_DE_BIBLIOTHEQUE`].
