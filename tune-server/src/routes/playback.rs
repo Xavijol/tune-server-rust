@@ -146,6 +146,20 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     {
         return refus_bitperfect_strict(&refus, lang);
     }
+    // #6018 — « Lecture Spotify (expérimental) » désactivée : un état de
+    // réglage, pas une panne. 409 au code stable, phrase traduite ; sans
+    // cette branche, le fourre-tout (« Spotify ») en faisait un 502.
+    if e.contains(tune_core::streaming::spotify_lecture::SENTINELLE_NON_ACTIVEE) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "spotify_playback_disabled",
+                "code": "spotify_playback_disabled",
+                "message": crate::i18n::t(lang, "spotify.playback.disabled"),
+            })),
+        )
+            .into_response();
+    }
     // Orphan-zone sentinel from orchestrator.play(): the zone row has no
     // output_device_id, so playback can never produce sound (Yacine, 24/07).
     // 409 Conflict: the request is well-formed but the zone's state makes it
@@ -1413,6 +1427,12 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/stop", post(stop))
         .route("/{id}/next", post(next))
         .route("/{id}/previous", post(previous))
+        // #6066 — le lecteur d'une zone navigateur dit qu'il joue : c'est la
+        // seule preuve d'écoute qui ne soit pas une sonde de plage.
+        .route(
+            "/{id}/browser-playing",
+            post(lecture_navigateur::signaler_lecture_navigateur),
+        )
         .route("/{id}/seek", post(seek))
         .route("/{id}/volume", post(set_volume))
         .route("/{id}/shuffle", post(toggle_shuffle))
@@ -1523,6 +1543,8 @@ mod refus_entier_negatif_3966;
 #[cfg(test)]
 mod saut_hors_file_4283;
 
+#[path = "playback/lecture_navigateur.rs"]
+mod lecture_navigateur;
 /// #5395 — la radio artiste à la demande.
 mod radio_artiste;
 
@@ -1844,6 +1866,33 @@ mod refus_de_format_3234 {
     /// Témoin : le refus reste une branche à part. Une erreur de lecture
     /// ordinaire garde exactement le code et le nom qu'elle avait avant #3234 —
     /// sans quoi le nouveau 422 avalerait des pannes réelles.
+    /// #6018 — Spotify non activé (option expérimentale) : un 409 au code
+    /// stable et une phrase traduite, pas le 502 `upstream_error` du
+    /// fourre-tout (le motif contient « Spotify »).
+    #[tokio::test]
+    async fn spotify_6018_lecture_non_activee_rend_un_refus_propre() {
+        let e = format!(
+            "source « spotify » : {}{}",
+            tune_core::streaming::spotify_lecture::SENTINELLE_NON_ACTIVEE,
+            tune_core::streaming::spotify_lecture::MOTIF_NON_ACTIVEE
+        );
+        for (lang, phrase) in [
+            ("fr", "Lecture Spotify non activée"),
+            ("en", "Spotify playback is not enabled"),
+        ] {
+            let reponse = play_error_response(e.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT);
+            let corps = axum::body::to_bytes(reponse.into_body(), 64 * 1024)
+                .await
+                .expect("corps de la réponse");
+            let corps: Value = serde_json::from_slice(&corps).expect("corps JSON");
+            assert_eq!(corps["error"], "spotify_playback_disabled");
+            assert_eq!(corps["code"], "spotify_playback_disabled");
+            let message = corps["message"].as_str().unwrap_or_default();
+            assert!(message.contains(phrase), "{lang} : {message}");
+        }
+    }
+
     #[tokio::test]
     async fn une_panne_de_lecture_ordinaire_garde_son_code() {
         let reponse = play_error_response("decode timeout".into(), "fr");

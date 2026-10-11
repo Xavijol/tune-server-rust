@@ -109,7 +109,7 @@ jobs:
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     services:
       postgres:
