@@ -133,6 +133,12 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("source", Famille::Source),
     deux("folder", Famille::Repertoire),
     deux("year", Famille::Nombre),
+    // #6124 — l'année de sortie ORIGINALE (`albums.original_year` : balises
+    // ORIGINALDATE / ORIGINALRELEASEDATE / ORIGINALYEAR / TDOR, ou
+    // MusicBrainz) et la VERSION de la piste (balise VERSION : original,
+    // réédition, remaster…, `track_metadata['version']`).
+    deux("original_year", Famille::Nombre),
+    deux("version", Famille::Texte),
     deux("sample_rate", Famille::Nombre),
     deux("bit_depth", Famille::Nombre),
     deux("track_count", Famille::Nombre),
@@ -465,16 +471,102 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : trente et une définitions, dont vingt-neuf aux
+    /// Le compte du client : trente-trois définitions, dont trente et une aux
     /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
-    /// #6121 : « Artiste de l'album »). Si ce nombre bouge, `smartRegles.ts`
-    /// doit bouger aussi.
+    /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
+    /// et « Version »). Si ce nombre bouge, `smartRegles.ts` doit bouger
+    /// aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 31);
+        assert_eq!(CRITERES.len(), 33);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            29
+            31
+        );
+    }
+    // ---------------------------------------------------------------------
+    // #6124 — « Année de sortie originale » et « Version ».
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus : Kind of Blue sorti à l'origine en
+    /// 1959, Giant Steps en 1960 ; « Blue in Green » balisée
+    /// `VERSION=Remaster 2009`, « Giant Steps » `VERSION=Mono`.
+    fn avec_dates_et_versions() -> SqliteDb {
+        let db = bibliotheque();
+        db.execute_batch(
+            "UPDATE albums SET original_year = 1959 WHERE id = 1; \
+             UPDATE albums SET original_year = 1960 WHERE id = 2; \
+             INSERT INTO track_metadata (track_id, key, value) VALUES \
+               (1,'version','Remaster 2009'), (3,'version','Mono'), \
+               (2,'original_date','1959-08-17');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn l_annee_originale_filtre_les_deux_niveaux_6124() {
+        let db = avec_dates_et_versions();
+        assert_eq!(
+            pistes(&db, &regle("original_year", "=", json!(1959))),
+            vec![1, 2]
+        );
+        assert_eq!(
+            pistes(&db, &regle("original_year", ">", json!(1959))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("original_year", "between", json!([1950, 1965]))),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            albums(&db, &regle("original_year", "<", json!("1960"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("original_year", "between", json!("1955,1960"))),
+            vec![1, 2]
+        );
+        // Un album sans année originale ne passe aucune comparaison.
+        assert!(!pistes(&db, &regle("original_year", "!=", json!(1959))).contains(&4));
+    }
+
+    #[test]
+    fn la_version_filtre_les_deux_niveaux_6124() {
+        let db = avec_dates_et_versions();
+        assert_eq!(
+            pistes(&db, &regle("version", "=", json!("remaster 2009"))),
+            vec![1]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "contains", json!("MONO"))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "starts_with", json!("Rem"))),
+            vec![1]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "in", json!("mono, autre"))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "is_not_null", Value::Null)),
+            vec![1, 3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "is_null", Value::Null)),
+            vec![2, 4]
+        );
+        // Une autre clé de `track_metadata` n'est pas la version.
+        assert!(!pistes(&db, &regle("version", "contains", json!("1959"))).contains(&2));
+        assert_eq!(
+            albums(&db, &regle("version", "contains", json!("mono"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("version", "=", json!("Remaster 2009"))),
+            vec![1]
         );
     }
 

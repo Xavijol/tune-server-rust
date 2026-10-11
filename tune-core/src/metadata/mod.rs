@@ -4,6 +4,8 @@ pub mod artist_enrichment;
 pub mod artist_split;
 pub mod artistes_du_pressage;
 pub mod auto_fix;
+// Les balises réellement présentes dans un fichier, lues brutes (#6124).
+pub mod balises_brutes;
 pub mod batch;
 pub mod bio_batch;
 pub mod choix_de_pressage;
@@ -3782,8 +3784,21 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
 
     let bpm = get(ItemKey::Bpm).and_then(|s| s.parse::<f64>().ok());
 
-    let original_year =
-        get(ItemKey::OriginalReleaseDate).and_then(|s| s.get(..4)?.parse::<u32>().ok());
+    // La tête Vorbis, lue AU PLUS une fois et seulement si un repli la
+    // demande : `SETSUBTITLE` et `ORIGINALRELEASEDATE` (#6124) la partagent.
+    let tete_vorbis = std::cell::OnceCell::new();
+    let tete = || tete_vorbis.get_or_init(|| read_vorbis_header(path));
+    // #6124 — `ORIGINALRELEASEDATE` (Vorbis), que lofty écarte : sans lui,
+    // un album balisé ainsi n'avait pas de date de sortie originale.
+    let original_date = get(ItemKey::OriginalReleaseDate).or_else(|| {
+        tete()
+            .as_deref()
+            .and_then(|h| find_vorbis_comment(h, "ORIGINALRELEASEDATE"))
+            .and_then(|v| balises_brutes::date_valide(&v))
+    });
+    let original_year = original_date
+        .as_deref()
+        .and_then(|s| s.get(..4)?.parse::<u32>().ok());
 
     let total_tracks = tag
         .track_total()
@@ -3924,7 +3939,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         // key in D. Pamingle's Vademecum. Read it raw as a fallback so those
         // files show per-disc subtitles too (Dominique, v0.9.9).
         disc_subtitle: get(ItemKey::SetSubtitle)
-            .or_else(|| raw_vorbis_comment(path, "SETSUBTITLE")),
+            .or_else(|| find_vorbis_comment(tete().as_deref()?, "SETSUBTITLE")),
         year: tag
             .date()
             .map(|d| d.year as u32)
@@ -3937,7 +3952,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
             }),
         original_year,
         release_date: get(ItemKey::ReleaseDate),
-        original_date: get(ItemKey::OriginalReleaseDate),
+        original_date,
         genre,
         genres,
         duration_ms: {
@@ -4188,9 +4203,8 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     if let Some(v) = get(ItemKey::ReleaseDate) {
         meta.insert("release_date".into(), v);
     }
-    if let Some(v) = get(ItemKey::OriginalReleaseDate) {
-        meta.insert("original_date".into(), v);
-    }
+    // `original_date` et `version` (#6124) : plus bas, une fois la tête
+    // Vorbis lue — leurs clés brutes ne passent pas par lofty.
 
     // Technical
     if let Some(v) = get(ItemKey::EncodedBy) {
@@ -4209,6 +4223,37 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
     // La tête Vorbis est lue UNE fois, pour `SOURCE` comme pour les quatre
     // graphies du DR plus bas (#5397) : `raw_vorbis_comment` la relisait.
     let header = read_vorbis_header(path);
+    // #6124 — la date de sortie ORIGINALE et la VERSION (original, réédition,
+    // remaster…). lofty ne range sous `OriginalReleaseDate` que
+    // `ORIGINALDATE` / `ORIGINALYEAR` (Vorbis, APE), `TDOR` (et la `TORY`
+    // d'un ID3v2.3, qu'il convertit) et l'atome MP4 `ORIGINALDATE` ; il
+    // écarte `ORIGINALRELEASEDATE`, tout `TXXX:ORIGINAL…`, les atomes MP4
+    // `ORIGINALYEAR` / `ORIGINALRELEASEDATE`, et `VERSION` partout. On relit
+    // donc les clés BRUTES : dans la tête Vorbis déjà lue (aucune E/S de
+    // plus), sinon par le type concret du fichier. La valeur de lofty ne sert
+    // qu'en dernier recours ; une date qui ne commence pas par une année est
+    // écartée (`balises_brutes::date_valide`).
+    {
+        let brutes: Vec<(String, String)> = match header.as_deref() {
+            Some(h) => balises_brutes::CLES_DATE_ORIGINALE
+                .iter()
+                .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
+                .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
+                .collect(),
+            None => balises_brutes::lire_balises_du_fichier(path)
+                .map(|b| b.paires())
+                .unwrap_or_default(),
+        };
+        if let Some(v) = balises_brutes::date_originale_parmi(&brutes).or_else(|| {
+            get(ItemKey::OriginalReleaseDate).and_then(|v| balises_brutes::date_valide(&v))
+        }) {
+            meta.insert("original_date".into(), v);
+        }
+        if let Some(v) = balises_brutes::version_parmi(&brutes) {
+            meta.insert("version".into(), v);
+        }
+    }
     if let Some(v) = get(ItemKey::OriginalMediaType)
         .or_else(|| find_vorbis_comment(header.as_deref()?, "SOURCE"))
     {
