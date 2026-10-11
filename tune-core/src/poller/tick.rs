@@ -180,6 +180,13 @@ impl PositionPoller {
                     crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
                         .update_volume(zone_id, vol_pct)
                         .ok();
+                    // #6008 — l'adoption se dit au journal.
+                    volume_adopte_6008::journaliser_volume_adopte(
+                        zone_id,
+                        &device_id,
+                        db_vol,
+                        status.volume,
+                    );
                 }
                 // Remember what the renderer reported so the next tick can
                 // detect a genuine change.
@@ -1162,6 +1169,13 @@ impl PositionPoller {
                         crate::db::zone_repo::ZoneRepo::with_backend(db)
                             .update_volume(zone_id, vol_pct)
                             .ok();
+                        // #6008 — l'adoption se dit au journal.
+                        volume_adopte_6008::journaliser_volume_adopte(
+                            zone_id,
+                            &device_id,
+                            zone_state.volume,
+                            status.volume,
+                        );
                     }
                     ps.last_device_volume = Some(status.volume);
                 }
@@ -1509,6 +1523,13 @@ impl PositionPoller {
                 crate::db::zone_repo::ZoneRepo::with_backend(db)
                     .update_volume(zone_id, vol_pct)
                     .ok();
+                // #6008 — l'adoption se dit au journal.
+                volume_adopte_6008::journaliser_volume_adopte(
+                    zone_id,
+                    &device_id,
+                    zone_state.volume,
+                    status.volume,
+                );
             }
             // Edge-triggered like the stopped/radio paths: record the reported
             // volume so a renderer stuck at a persistent default (HiFi Rose
@@ -3035,6 +3056,17 @@ impl PositionPoller {
                             status.position_ms,
                         )
                     } {
+                        // #5970 — la fin estimée de la piste en cours, prise
+                        // AVANT les lectures de la base qui suivent : c'est
+                        // elle qui borne la préparation de la suivante.
+                        let fin_estimee = Instant::now()
+                            + Duration::from_millis(
+                                decisions::sane_current_duration(
+                                    status.duration_ms,
+                                    track_duration_ms,
+                                )
+                                .saturating_sub(status.position_ms),
+                            );
                         // Only send SetNextAVTransportURI if gapless is enabled for this zone
                         let gapless_enabled = ZoneRepo::with_backend(self.db.clone())
                             .get(zone_id)
@@ -3101,7 +3133,23 @@ impl PositionPoller {
                                 // (spin 1 Hz, #2394). handle_track_end jouera la
                                 // piste explicitement en fin de morceau.
                             } else {
-                                match self.prepare_gapless(zone_id, zone_state, &device_id).await {
+                                // #5970 — la préparation est bornée (voir
+                                // `armer_le_flux_suivant`) ; sa durée est dite
+                                // au journal dès qu'elle dépasse le seuil.
+                                let t_prep = Instant::now();
+                                let preparation = self
+                                    .prepare_gapless(zone_id, zone_state, &device_id, fin_estimee)
+                                    .await;
+                                let prep_ms = t_prep.elapsed().as_millis() as u64;
+                                if prep_ms >= decisions::PREPARATION_GAPLESS_LENTE_MS {
+                                    info!(
+                                        zone_id,
+                                        prep_ms,
+                                        issue = ?preparation,
+                                        "gapless_preparation_lente"
+                                    );
+                                }
+                                match preparation {
                                     GaplessPrep::Armed(arme, tenue) => {
                                         ps.gapless_sent_at = Some(Instant::now());
                                         ps.gapless_sent = true;
@@ -3115,7 +3163,11 @@ impl PositionPoller {
                                         ps.suivante_preparee = tenue;
                                         ps.transition(fsm::armement_accepte(arme));
                                     }
-                                    GaplessPrep::DsdNextSkipped => {
+                                    // #5970 — une préparation abandonnée
+                                    // se verrouille comme un DSD : pas de
+                                    // nouvel essai pour cette position, la
+                                    // fin de piste joue la suivante.
+                                    GaplessPrep::DsdNextSkipped | GaplessPrep::Abandonnee => {
                                         ps.gapless_dsd_skip_pos = Self::prochaine_position_jouable(
                                             &self.db, zone_id, zone_state,
                                         );
@@ -3234,6 +3286,33 @@ impl PositionPoller {
                     // n'enchaînera pas (25/08 : PLAYING éternel) ; attendre
                     // `durée + END_MARGIN_MS` sur l'horloge de Tune n'ajoutait
                     // que du silence.
+                    // #4382, rc4 — renderer qui n'enchaîne pas seul : la
+                    // dernière seconde est guettée à 100 ms, et la fin vaut
+                    // dès que la queue de piste est jouée, sans attendre un
+                    // sondage « inchangé » (jusqu'à 1,35 s de silence).
+                    let flux_courant = zone_state
+                        .now_playing
+                        .as_ref()
+                        .and_then(|np| np.stream_id.as_deref());
+                    if !in_seek_grace {
+                        self.lancer_le_guet_si_besoin(
+                            zone_id,
+                            &device_id,
+                            flux_courant,
+                            is_dlna,
+                            ps.gapless_sent,
+                            track_duration_ms,
+                            status.duration_ms,
+                            status.position_ms,
+                        )
+                        .await;
+                    }
+                    let position_precedente_pour_l_epingle =
+                        if is_dlna && self.fin_precise_atteinte(zone_id, flux_courant) {
+                            status.position_ms
+                        } else {
+                            prev_position_ms
+                        };
                     let epingle_piste_finie = !in_seek_grace
                         && decisions::dlna_epingle_sur_la_piste_finie(
                             is_dlna,
@@ -3242,7 +3321,7 @@ impl PositionPoller {
                             track_duration_ms,
                             status.duration_ms,
                             status.position_ms,
-                            prev_position_ms,
+                            position_precedente_pour_l_epingle,
                             decisions::uri_nomme_le_flux(
                                 status.current_uri.as_deref(),
                                 zone_state

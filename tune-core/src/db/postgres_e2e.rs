@@ -973,6 +973,93 @@ async fn pg_history_round_trip() {
     );
 }
 
+/// #6079 — l'album et l'artiste CHEZ LE SERVICE d'une ligne de file entrent
+/// et ressortent sur PostgreSQL : `queue_items.artist_ref` (PG 087) existe
+/// après `ensure_schema`, les deux écritures de la file la nomment, et la
+/// jumelle 087 se rejoue sans erreur (idempotence).
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_6079_la_file_garde_l_artiste_de_service() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use crate::db::zone_repo::ZoneRepo;
+
+    let db = pg_or_skip!();
+    reset_schema(&db);
+    let _ = db.execute("DELETE FROM queue_items", &[]);
+    // Le script tel que le lanceur le joue (un bloc `DO $…$` : pas de
+    // découpage au point-virgule), rejoué sur une base qui l'a déjà.
+    let url = std::env::var("TUNE_TEST_PG_URL").expect("posée : pg_or_skip l'a vérifié");
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../migrations/postgres/087_queue_items_artist_ref.sql"
+    ))
+    .execute(&pool)
+    .await
+    .expect("la migration 087 doit se rejouer");
+    let zid = ZoneRepo::with_backend(db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:6079"))
+        .unwrap();
+    let repo = PlayQueueRepo::with_backend(db.clone());
+    let ligne = |id: &str, album: Option<&str>, artiste: Option<&str>| QueueInput::Streaming {
+        source: "qobuz".into(),
+        source_id: id.into(),
+        title: format!("Titre {id}"),
+        artist: "Artiste".into(),
+        album: None,
+        cover_url: None,
+        duration_ms: 1_000,
+        track_number: None,
+        disc_number: None,
+        album_ref: album.map(str::to_string),
+        artist_ref: artiste.map(str::to_string),
+    };
+    repo.append(
+        zid,
+        &[
+            ligne("q1", Some("q-alb-7"), Some("q-art-9")),
+            ligne("q2", None, None),
+        ],
+    )
+    .unwrap();
+    let file = repo.get_ordered(zid).unwrap();
+    assert_eq!(file[0].album_id_service(), Some("q-alb-7"));
+    assert_eq!(file[0].artist_id_service(), Some("q-art-9"));
+    assert_eq!(file[1].artist_id_service(), None);
+    let vue = repo.get_streaming_queue(zid).unwrap();
+    assert_eq!(vue[0]["artist_ref"].as_str(), Some("q-art-9"));
+
+    let piste = |id: &str| {
+        (
+            id.to_string(),
+            format!("Titre {id}"),
+            "Artiste".to_string(),
+            None,
+            None,
+            1_000i64,
+            Some("tidal".to_string()),
+            None,
+            None,
+        )
+    };
+    repo.set_streaming_queue_avec_references(
+        zid,
+        &[piste("t1"), piste("t2")],
+        &[Some("t-alb".into()), None],
+        &[Some("t-art-1".into()), Some("t-art-2".into())],
+    )
+    .unwrap();
+    let artistes: Vec<Option<String>> = repo
+        .get_ordered(zid)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.artist_ref)
+        .collect();
+    assert_eq!(
+        artistes,
+        vec![Some("t-art-1".to_string()), Some("t-art-2".to_string())]
+    );
+    let _ = db.execute("DELETE FROM queue_items", &[]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn pg_settings_round_trip() {
     use crate::db::settings_repo::SettingsRepo;
@@ -3133,6 +3220,8 @@ async fn pg_2094_rattrapage_des_sous_titres_des_coffrets() {
     crate::db::coffrets_auto::tests::scenario_disque_tardif_2094(&db);
     reset_schema(&db);
     crate::db::coffrets_auto::tests::scenario_rattrapage_par_les_balises_2094(&db);
+    reset_schema(&db);
+    crate::db::coffrets_auto::tests::scenario_defaire_rend_le_nom_de_la_balise_5644(&db);
 }
 
 /// Fil 2094, suite de #5812 — la relecture des fichiers d'un coffret
@@ -3185,4 +3274,99 @@ async fn pg_bio_reecrite_a_la_main_oublie_sa_provenance() {
             .unwrap()
     );
     assert_eq!(repo.bio_provenance(id).unwrap(), None);
+}
+
+/// b209 — l'ordre des pistes d'un album et le rattrapage des numéros 0 UPnP,
+/// sur PostgreSQL. Jumeau de `track_repo::tests_b209_ordre_dans_l_album` :
+/// PostgreSQL place NULL EN FIN d'un tri croissant, SQLite EN TÊTE — la même
+/// fiche doit rendre le même ordre sur les deux moteurs.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_b209_ordre_dans_l_album_et_rattrapage_des_zeros_upnp() {
+    use crate::db::backend::ToSqlValue;
+    use crate::db::track_repo::TrackRepo;
+    use crate::db::track_repo::tests_b209_ordre_dans_l_album::{ATTENDU, PISTES};
+
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL not set, skipping PG E2E test");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations");
+    let db: Arc<dyn DbBackend> = Arc::new(PostgresBackend::new(pool.clone()));
+    reset_schema(&db);
+    let album = db
+        .execute_returning_id("INSERT INTO albums (title) VALUES ('Album b209')", &[])
+        .unwrap();
+    let mut ids = std::collections::HashMap::new();
+    for (id, titre, disque, numero, source) in PISTES {
+        let nouvel = db
+            .execute_returning_id(
+                "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+                 VALUES ($1, $2, $3, $4, $5, 1000)",
+                &[
+                    &titre.to_string() as &dyn ToSqlValue,
+                    &album,
+                    &disque.map(|v| v as i32),
+                    &numero.map(|v| v as i32),
+                    &source.to_string(),
+                ],
+            )
+            .unwrap();
+        ids.insert(id, nouvel);
+    }
+    let repo = TrackRepo::with_backend(db.clone());
+    let titres: Vec<String> = repo
+        .list_by_album(album)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.title)
+        .collect();
+    assert_eq!(
+        titres, ATTENDU,
+        "sans le correctif, PostgreSQL place la piste à 0 devant la piste 1"
+    );
+
+    // Rattrapage : un ancien import UPnP à 0 passe à NULL au démarrage, une
+    // piste locale à 0 reste à 0.
+    let ancien = db
+        .execute_returning_id(
+            "INSERT INTO tracks (title, album_id, disc_number, track_number, source, duration_ms) \
+             VALUES ('Ancien import', $1, 0, 0, 'upnp', 1000)",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .expect("migrations rejouées");
+    let valeur = |id: i64, colonne: &str| {
+        db.query_one(
+            &format!("SELECT {colonne} FROM tracks WHERE id = $1"),
+            &[&id as &dyn ToSqlValue],
+        )
+        .unwrap()
+        .unwrap()
+        .first()
+        .and_then(|v| v.as_i64())
+    };
+    assert_eq!(
+        valeur(ancien, "track_number"),
+        None,
+        "sans le rattrapage : 0"
+    );
+    assert_eq!(valeur(ancien, "disc_number"), None);
+    assert_eq!(
+        valeur(ids[&5], "track_number"),
+        Some(0),
+        "piste locale intacte"
+    );
+    assert_eq!(valeur(ids[&2], "track_number"), Some(1));
+
+    // Idempotence de l'indexation : `IS DISTINCT FROM`, pas `=`, pour que
+    // NULL contre NULL ne compte pas comme un changement.
+    crate::db::track_repo::tests_b209_ordre_dans_l_album::regle_d_idempotence_upnp(
+        db.clone(),
+        ids[&3],
+    );
 }
