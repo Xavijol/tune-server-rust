@@ -2184,6 +2184,14 @@ impl PlaybackOrchestrator {
                         track_id,
                         media.channels,
                     ));
+                    // #6171 — les canaux de la carte que la zone vise. Ce
+                    // n'est pas un traitement : chaque mot va tel quel à sa
+                    // position, donc PURE compris. Seul le bras ASIO les lit.
+                    local_output.set_canaux_de_carte(
+                        crate::outputs::canaux_de_carte_6171::CanauxDeCarte::lire(
+                            &self.db, zone_id,
+                        ),
+                    );
                     // #6057 — la disposition des canaux que le FICHIER déclare
                     // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
                     // voie par sa position. Rien en PURE : chemin intouché.
