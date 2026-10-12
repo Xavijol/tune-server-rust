@@ -530,6 +530,9 @@ pub(super) fn zone_reaffectation_step(
     Some(regle.description())
 }
 
+/// #6221 — le libellé de l'étape qui décompresse un DST en DSF.
+pub(super) const LIBELLE_DST_EN_DSF: &str = "DST décompressé \u{2192} DSF";
+
 /// La famille DSD que désigne une cadence brute (2,8 MHz → DSD64, etc.).
 ///
 /// Une seule table pour la ligne Source et pour l'étage de sortie : elles
@@ -1077,6 +1080,7 @@ fn assembler_les_etapes(
         conteneur_flac_copie,
         canaux_source,
         canaux_du_fil,
+        dst_reconstruit_en_dsf,
         ..
     } = analyse.source;
     let Traitements {
@@ -1154,6 +1158,17 @@ fn assembler_les_etapes(
         });
         marquer_codec_inconnu(&mut decodeur);
         steps.push(decodeur);
+    }
+    // #6221 — un DSDIFF DST servi en DSD natif : le DST est DÉCOMPRESSÉ (sans
+    // perte) et remis en DSF à la volée. C'est la seule opération sur le
+    // flux ; aucune étape de conversion PCM n'existe, et le fil (DSF, DSD
+    // brut) n'en fait apparaître aucune.
+    if dst_reconstruit_en_dsf {
+        steps.push(json!({
+            "name": "Decoder",
+            "description": LIBELLE_DST_EN_DSF,
+            "bit_perfect": true,
+        }));
     }
 
     // Transcoding step (only if transcoding occurs). Include the zone-forced
@@ -2467,6 +2482,10 @@ struct Source<'w> {
     /// session (`StreamInfo.channels`). C'est une mesure, pas une déduction :
     /// le même nombre que le `nrAudioChannels` annoncé au renderer.
     canaux_du_fil: Option<u16>,
+    /// #6221 — le fil porte un DSF FABRIQUÉ depuis un DSDIFF compressé DST
+    /// (`StreamInfo::dsd_reconstruit_depuis_dst`, posé par la session) : DSD
+    /// natif décompressé, aucune conversion PCM.
+    dst_reconstruit_en_dsf: bool,
 }
 
 /// The radio decoder emits 16-bit PCM and can adapt low source rates.
@@ -2528,6 +2547,7 @@ fn decrire_la_source<'w>(
             // Une radio n'a pas de ligne `tracks` : rien à comparer.
             canaux_source: None,
             canaux_du_fil: None,
+            dst_reconstruit_en_dsf: false,
         };
     }
     // Verbatim proxy radios keep their existing wire/NowPlaying metadata
@@ -2687,5 +2707,6 @@ fn decrire_la_source<'w>(
             .filter(|c| *c > 0)
             .map(|c| c as u16),
         canaux_du_fil: wire.map(|w| w.channels).filter(|c| *c > 0),
+        dst_reconstruit_en_dsf: is_dsd && wire.is_some_and(|w| w.dsd_reconstruit_depuis_dst),
     }
 }

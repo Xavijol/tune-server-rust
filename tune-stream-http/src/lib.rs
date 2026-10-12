@@ -1729,12 +1729,22 @@ async fn serve_file(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // #6221 — fichier VIRTUEL (DSF fabriqué depuis un DST) : sa taille et
+    // ses octets remplacent ceux du fichier source, Range compris.
+    let virtuelle = session
+        .source_virtuelle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let file_path = std::path::Path::new(path);
     let disk_size = match tokio::fs::metadata(file_path).await {
         Ok(m) => m.len(),
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
-    let file_size = faststart.as_ref().map(|m| m.total).unwrap_or(disk_size);
+    let file_size = match virtuelle.as_ref() {
+        Some(v) => v.total(),
+        None => faststart.as_ref().map(|m| m.total).unwrap_or(disk_size),
+    };
 
     let range_header = req_headers
         .get("Range")
@@ -1791,19 +1801,22 @@ async fn serve_file(
         // Track served bytes so the poller can tell an actively-fetching
         // renderer from a genuinely-stalled one (fixes false force-stop of
         // DLNA renderers that report Stopped while streaming — Linn, RS130).
-        let body = build_file_body(
-            faststart.clone(),
-            path.to_string(),
-            start,
-            length,
-            session.clone(),
-            debit_nominal_octets_par_seconde(
-                &info.format,
-                info.sample_rate,
-                info.bit_depth,
-                info.channels,
+        let body = match virtuelle.clone() {
+            Some(v) => corps_virtuel(v, start, length, session.clone()),
+            None => build_file_body(
+                faststart.clone(),
+                path.to_string(),
+                start,
+                length,
+                session.clone(),
+                debit_nominal_octets_par_seconde(
+                    &info.format,
+                    info.sample_rate,
+                    info.bit_depth,
+                    info.channels,
+                ),
             ),
-        );
+        };
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -1825,20 +1838,69 @@ async fn serve_file(
         HeaderValue::from_static("DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"),
     );
 
-    let body = build_file_body(
-        faststart,
-        path.to_string(),
-        0,
-        file_size,
-        session.clone(),
-        debit_nominal_octets_par_seconde(
-            &info.format,
-            info.sample_rate,
-            info.bit_depth,
-            info.channels,
+    let body = match virtuelle {
+        Some(v) => corps_virtuel(v, 0, file_size, session.clone()),
+        None => build_file_body(
+            faststart,
+            path.to_string(),
+            0,
+            file_size,
+            session.clone(),
+            debit_nominal_octets_par_seconde(
+                &info.format,
+                info.sample_rate,
+                info.bit_depth,
+                info.channels,
+            ),
         ),
-    );
+    };
     (StatusCode::OK, headers, body).into_response()
+}
+
+/// #6221 — le corps d'une tranche `[start, start + length)` d'un fichier
+/// virtuel. Le producteur (bloquant : il décode du DST) tourne sur un fil
+/// `spawn_blocking` et pousse ses morceaux dans un canal borné : il ne
+/// décode pas plus vite que le renderer ne tire, et s'arrête dès que le
+/// corps est abandonné (canal fermé). Mêmes compteurs que `build_file_body`.
+fn corps_virtuel(
+    source: std::sync::Arc<dyn tune_core::http::streamer::SourceVirtuelle>,
+    start: u64,
+    length: u64,
+    byte_counter: std::sync::Arc<StreamSession>,
+) -> Body {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+    let stream_id = byte_counter.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut rendre = |morceau: Vec<u8>| {
+            tx.blocking_send(morceau)
+                .map_err(|_| tune_core::audio::dsf_depuis_dst::CONSOMMATEUR_PARTI.to_string())
+        };
+        if let Err(e) = source.lire(start, length, &mut rendre)
+            && e != tune_core::audio::dsf_depuis_dst::CONSOMMATEUR_PARTI
+        {
+            warn!(stream_id = %stream_id, error = %e, "fichier_virtuel_lecture_en_echec");
+        }
+    });
+    let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length, None);
+    Body::from_stream(async_stream::stream! {
+        let mut remaining = length;
+        while remaining > 0 {
+            let Some(morceau) = rx.recv().await else { break };
+            let n = (morceau.len() as u64).min(remaining);
+            remaining -= n;
+            byte_counter.bytes_sent.fetch_add(n, Relaxed);
+            chrono.compter(n);
+            let mut octets = bytes::Bytes::from(morceau);
+            octets.truncate(n as usize);
+            yield Ok::<_, std::io::Error>(octets);
+        }
+        if remaining == 0 {
+            chrono.noter_fin(FinDuService::Complet);
+        } else {
+            chrono.noter_fin(FinDuService::FichierPlusCourt);
+        }
+    })
 }
 
 /// Taille de l'en-tête que TOUS les WAV de Tune portent
@@ -5390,6 +5452,10 @@ mod bruit_trois_connexions_b209bruit;
 #[cfg(test)]
 mod bruit_suspect_de_bout_en_bout_6130;
 
+/// #6221 — un fichier virtuel (DSF fabriqué depuis un DST) servi avec le
+/// contrat fichier : Content-Length, Range, 416.
+#[cfg(test)]
+mod fichier_virtuel_6221;
 #[cfg(test)]
 mod plages_avplayer_b209;
 
