@@ -376,6 +376,12 @@ path = "tests/radios_libelles_localises.rs"
 name = "favori_bandcamp_survit_a_la_resignature_4577"
 path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
 
+# #5677 — l'écriture d'une passe d'indexation UPnP (synchronisation horaire)
+# ne tient pas un fil de l'exécuteur. Rangée au MILIEU du manifeste.
+[[test]]
+name = "indexation_upnp_hors_executeur_5677"
+path = "tests/indexation_upnp_hors_executeur_5677.rs"
+
 # #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
 # qui DISENT quand ils mordent. Mesuré sur les routes montées.
 #
