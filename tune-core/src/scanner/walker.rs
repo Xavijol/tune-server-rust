@@ -1428,7 +1428,8 @@ pub fn list_audio_files_avec_arret(
                     // Skip macOS AppleDouble sidecar files (._foo.flac): they carry
                     // the audio extension but are tiny resource-fork metadata, not
                     // real tracks, and were being indexed as bogus duplicates (Elie).
-                    if entry.file_name().to_string_lossy().starts_with("._") {
+                    if crate::scanner::est_un_nom_appledouble(&entry.file_name().to_string_lossy())
+                    {
                         continue;
                     }
                     // Skip Tune's own streaming/transcode temp files
