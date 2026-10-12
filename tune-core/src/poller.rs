@@ -1008,6 +1008,8 @@ impl PositionPoller {
 }
 
 mod radio;
+/// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
+mod titre_radio_didl_2991;
 
 mod fin_de_piste;
 /// #4382 — un `Next` acquitté que le transport déclare ignoré.

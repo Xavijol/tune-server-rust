@@ -39,6 +39,10 @@ pub(crate) mod pause_701_tests_5050;
 #[path = "dlna_volume_scpd_tests_5793.rs"]
 mod volume_scpd_tests_5793;
 
+/// #2991 — le titre radio réémis par DIDL, pour les lecteurs qui ignorent l'ICY.
+#[path = "dlna_titre_radio_2991.rs"]
+pub mod titre_radio_2991;
+
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
@@ -670,6 +674,9 @@ pub struct DlnaOutput {
     /// milieu du morceau. Le couple n'est donc utilisé que si l'URI en cours
     /// est bien celle qu'il décrit.
     duree_annoncee: tokio::sync::Mutex<Option<(String, u64)>>,
+    /// #2991 — la dernière pose d'URI acceptée (URI, MIME annoncé, niveau de
+    /// DIDL) : ce que la réémission du titre radio doit rejouer à l'identique.
+    pose_courante: std::sync::Mutex<Option<titre_radio_2991::PoseCourante>>,
 }
 
 /// Au bout de combien de temps de contradiction entre l'état poussé et la
@@ -795,6 +802,7 @@ impl DlnaOutput {
             dernier_diag_701: std::sync::Mutex::new(None),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
+            pose_courante: std::sync::Mutex::new(None),
             contact: std::sync::Mutex::new(super::dlna_contact::JournalDeContact::default()),
         }
     }
@@ -2447,6 +2455,7 @@ impl OutputTarget for DlnaOutput {
                     duree_ms = debut_set_uri.elapsed().as_millis() as u64,
                     "dlna_set_uri_ok"
                 );
+                self.noter_pose_courante(media, &attempt_mime, niveau_didl);
                 break;
             }
 

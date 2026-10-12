@@ -176,6 +176,12 @@ struct PatchZone {
     /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
     /// sondage complet plutôt que de servir un état inventé.
     upnp_silence: Option<bool>,
+    /// #2991 — « Envoyer le titre radio par DLNA (pour les lecteurs qui
+    /// ignorent l'ICY) ». `"off"` (défaut), `"next"` (`SetNextAVTransportURI`,
+    /// sans coupure) ou `"reload"` (`SetAVTransportURI` sur la même URI,
+    /// coupure probable). Persisté en setting `zone_{id}_dlna_radio_title`,
+    /// clé supprimée à `"off"`. Toute autre valeur est refusée.
+    dlna_radio_title: Option<String>,
     /// Modèle choisi par l'utilisateur (filtré par marque, ou texte libre).
     /// Persisté en setting `zone_{id}_model`. Chaîne vide = efface l'override.
     model: Option<String>,
@@ -338,6 +344,12 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_silence".into(), json!(upnp_silence));
+    // #2991 — le titre radio par DIDL. TOUJOURS publié : sa présence dit au
+    // client que ce serveur connaît le réglage.
+    obj.insert(
+        "dlna_radio_title".into(),
+        json!(tune_core::outputs::dlna::titre_radio_2991::mode_de_zone(backend, zone_id).as_str()),
+    );
     obj.insert(
         "upnp_silence_effets".into(),
         json!({
