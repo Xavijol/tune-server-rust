@@ -389,11 +389,13 @@ pub(crate) fn entrees_de_file(
     use tune_core::db::playlist_repo::EntryContent;
     entries
         .iter()
-        .map(|e| match &e.content {
-            EntryContent::Local(track_id) => QueueInput::Local {
+        .filter_map(|e| match &e.content {
+            EntryContent::Local(track_id) => Some(QueueInput::Local {
                 track_id: *track_id,
-            },
-            EntryContent::Service(s) => QueueInput::Streaming {
+            }),
+            // #6179 — une piste introuvable n'a rien à jouer.
+            EntryContent::Missing(_) => None,
+            EntryContent::Service(s) => Some(QueueInput::Streaming {
                 source: s.source.clone(),
                 source_id: s.source_id.clone(),
                 title: s.title.clone(),
@@ -412,9 +414,35 @@ pub(crate) fn entrees_de_file(
                     crate::routes::zones::identifiant_de_service_sur(s.album_source_id.as_deref())
                 },
                 artist_ref: None,
-            },
+            }),
         })
         .collect()
+}
+
+/// #6179 — retire les lignes introuvables d'une playlist avant lecture, et
+/// ramène `start_index` (rang dans la liste MONTRÉE, introuvables compris) au
+/// rang de la même ligne parmi les lignes gardées. Un départ sur une ligne
+/// introuvable part de la suivante jouable.
+pub(crate) fn sans_les_introuvables(
+    entries: Vec<tune_core::db::playlist_repo::PlaylistEntry>,
+    start_index: Option<i64>,
+) -> (
+    Vec<tune_core::db::playlist_repo::PlaylistEntry>,
+    Option<i64>,
+) {
+    let depart = start_index.map(|i| {
+        let i = usize::try_from(i).unwrap_or(0);
+        entries
+            .iter()
+            .take(i)
+            .filter(|e| e.missing().is_none())
+            .count() as i64
+    });
+    let jouables = entries
+        .into_iter()
+        .filter(|e| e.missing().is_none())
+        .collect();
+    (jouables, depart)
 }
 
 /// `POST /zones/{id}/play` avec `playlist_id` d'une playlist MIXTE (#4889).
@@ -2887,7 +2915,15 @@ async fn play(
             // garde le chemin ci-dessous, inchangé. L'ordre est celui de
             // `GET /playlists/{id}/tracks` (`get_entries`) : `start_index`
             // désigne la ligne que le client a montrée.
-            Ok(_) => match repo.get_entries(playlist_id) {
+            Ok(_) => match repo.get_entries(playlist_id).map(|e| {
+                // #6179 — le client compte les lignes INTROUVABLES dans ses
+                // rangs (`GET /playlists/{id}/tracks` les montre) ; la file,
+                // elle, ne les reçoit pas. `start_index` est ramené au rang de
+                // la même ligne parmi les lignes jouables.
+                let (jouables, depart) = sans_les_introuvables(e, body.start_index);
+                body.start_index = depart;
+                jouables
+            }) {
                 Ok(entries) if entries.iter().any(|e| e.service().is_some()) => {
                     return jouer_playlist_mixte(
                         &state,
@@ -9598,5 +9634,41 @@ mod precedent_zone_navigateur_tests {
             "la position relevée (0) fait foi : {v}"
         );
         assert_eq!(v["queue_position"], 0, "{v}");
+    }
+}
+
+#[cfg(test)]
+mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
+    use super::sans_les_introuvables;
+    use tune_core::db::playlist_repo::{EntryContent, MissingEntry, PlaylistEntry};
+
+    fn ligne(id: i64, content: EntryContent) -> PlaylistEntry {
+        PlaylistEntry {
+            id,
+            position: id,
+            content,
+        }
+    }
+
+    /// #6179 — le client compte la ligne introuvable dans ses rangs, la file
+    /// ne la reçoit pas : `start_index` désigne toujours la même ligne.
+    #[test]
+    fn le_rang_de_depart_suit_la_meme_ligne() {
+        let lignes = vec![
+            ligne(0, EntryContent::Local(10)),
+            ligne(1, EntryContent::Missing(MissingEntry::default())),
+            ligne(2, EntryContent::Local(12)),
+            ligne(3, EntryContent::Local(13)),
+        ];
+        let (jouables, depart) = sans_les_introuvables(lignes.clone(), Some(2));
+        assert_eq!(
+            jouables.iter().map(|e| e.track_id()).collect::<Vec<_>>(),
+            vec![Some(10), Some(12), Some(13)]
+        );
+        assert_eq!(depart, Some(1), "la ligne 2 montrée est la 1 de la file");
+        // Départ SUR la ligne introuvable : la suivante jouable.
+        assert_eq!(sans_les_introuvables(lignes.clone(), Some(1)).1, Some(1));
+        assert_eq!(sans_les_introuvables(lignes.clone(), Some(0)).1, Some(0));
+        assert_eq!(sans_les_introuvables(lignes, None).1, None);
     }
 }

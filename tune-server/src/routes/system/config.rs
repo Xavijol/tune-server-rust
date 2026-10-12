@@ -3139,11 +3139,12 @@ fn compter_liees(state: &AppState, sql_avant_in: &str, ids: &[i64]) -> i64 {
 /// Rendu AVANT toute suppression, pour que l'écran puisse le montrer. Les
 /// chiffres sont ceux des tables liées telles que le schéma les traite :
 ///
-/// - `playlists` : `playlist_tracks` est en `ON DELETE CASCADE` et les clés
-///   étrangères sont ACTIVES sous SQLite (`PRAGMA foreign_keys=ON`,
-///   `db/sqlite.rs`). Les entrées disparaissent des listes de lecture ; les
-///   listes elles-mêmes restent, éventuellement plus courtes. Aucune référence
-///   pendante.
+/// - `playlists` : depuis #6179, une entrée de liste de lecture ne disparaît
+///   plus avec sa piste : elle reste à son rang, INTROUVABLE, avec le titre,
+///   l'artiste et le chemin de la piste purgée (déclencheur
+///   `playlist_tracks_garde_l_orpheline`, clé étrangère en `SET NULL`), et la
+///   réconciliation la rattache si la piste existe ailleurs. Le compte dit
+///   combien d'entrées passeront introuvables.
 /// - `queue_items` : même cascade — les pistes quittent les files d'attente.
 /// - `listen_history` : `ON DELETE SET NULL`. **L'historique n'est pas
 ///   effacé** : la ligne survit avec son titre et son artiste, et perd son
@@ -3243,6 +3244,15 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.artistes_orphelins = ArtistRepo::with_backend(state.backend.clone())
         .cleanup_orphans()
         .unwrap_or(0);
+
+    // #6179 — les lignes de playlist des pistes purgées sont restées,
+    // introuvables, à leur rang : celles dont la piste existe ailleurs (autre
+    // NAS, même contenu) y sont rattachées tout de suite.
+    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+        state.backend.clone(),
+        true,
+        "purge",
+    );
 
     // `favorites` n'a pas de clé étrangère : sans cette réconciliation, les
     // cœurs pointeraient des ids morts. `false` = ne JAMAIS supprimer un
@@ -4307,9 +4317,10 @@ mod purge_hors_perimetre_tests {
 
     // ── Les objets liés ─────────────────────────────────────────────────
 
-    /// Une piste dans une liste de lecture : comportement EXPLICITE. L'entrée
-    /// quitte la liste (cascade), la liste survit, les autres entrées restent,
-    /// et l'impact est annoncé AVANT la suppression.
+    /// Une piste dans une liste de lecture : comportement EXPLICITE. Depuis
+    /// #6179 l'entrée ne quitte plus la liste : elle y reste INTROUVABLE, à
+    /// son rang, la liste survit, les autres entrées restent, et l'impact est
+    /// annoncé AVANT la suppression.
     #[tokio::test]
     async fn une_piste_en_liste_de_lecture_quitte_la_liste_sans_la_detruire() {
         let state = etat();
@@ -4358,8 +4369,22 @@ mod purge_hors_perimetre_tests {
         assert_eq!(
             restant,
             vec![gardee],
-            "l'entrée de la piste retirée doit partir, l'autre rester — aucune \
-             référence pendante"
+            "l'entrée de la piste retirée ne désigne plus aucune piste, l'autre \
+             reste — aucune référence pendante"
+        );
+        let introuvable: i64 = state
+            .backend
+            .query_one(
+                "SELECT COUNT(*) FROM playlist_tracks WHERE playlist_id = 1 \
+                 AND track_id IS NULL AND position = 0 AND file_path = '/vieux_nas/Bach/01.flac'",
+                &[],
+            )
+            .unwrap()
+            .and_then(|r| r.first().and_then(|v| v.as_i64()))
+            .unwrap();
+        assert_eq!(
+            introuvable, 1,
+            "#6179 : l'entrée reste, introuvable, à son rang"
         );
         let listes: i64 = state
             .backend

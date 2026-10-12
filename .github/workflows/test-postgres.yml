@@ -268,6 +268,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_4889 -- --nocapture
 
+      # #6179 — une ligne de playlist survit à sa piste : migration 089 (clé
+      # étrangère en SET NULL, CHECK à trois formes), déclencheur qui fige
+      # l'identité avant la suppression, réconciliation qui la rattache, sur
+      # les deux naissances (native et bascule tout-TEXT). Schémas de côté,
+      # supprimés à la fin.
+      - name: Lignes de playlist introuvables sur PostgreSQL (#6179)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6179 -- --nocapture
+
       # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
       # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
       # rien changer au schéma que Tune reçoit. Le test monte SES bases
