@@ -32,6 +32,15 @@ pub(crate) struct EtatFaux {
     /// Premier index rendu par `PlaylistGet` : 1, exprès, pour qu'une sortie
     /// qui CALCULERAIT l'index au lieu de le relire se trompe.
     pub(crate) base_index: usize,
+    /// #6115 — le comportement signalé en rc4 : tant que la lecture n'est
+    /// pas ARRÊTÉE (état 0), `PlaylistAdd clear="1"` est ignoré.
+    pub(crate) ignore_clear_hors_arret: bool,
+    /// #6115 — nombre de `Status` rendus en état 3 (STOPREQ) après un
+    /// `Stop`, avant l'état 0. Zéro : arrêt immédiat.
+    pub(crate) status_avant_arret: u32,
+    /// #6115 — `Stop` ne mène jamais à l'état 0 (borne d'attente).
+    pub(crate) n_arrete_jamais: bool,
+    restant_avant_arret: u32,
 }
 
 pub(crate) struct FauxHqplayer {
@@ -50,6 +59,13 @@ fn attribut(ligne: &str, nom: &str) -> Option<String> {
 fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
     etat.recu.push(ligne.to_string());
     if ligne.starts_with("<Status") {
+        if etat.etat == 3 && !etat.n_arrete_jamais {
+            if etat.restant_avant_arret == 0 {
+                etat.etat = 0;
+            } else {
+                etat.restant_avant_arret -= 1;
+            }
+        }
         let meta = if etat.annonce_uri {
             etat.playlist
                 .get(etat.courante)
@@ -80,7 +96,11 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
         return xml;
     }
     if ligne.starts_with("<PlaylistAdd") {
-        if attribut(ligne, "clear").as_deref() == Some("1") {
+        let vide = attribut(ligne, "clear").as_deref() == Some("1");
+        if vide && etat.ignore_clear_hors_arret && etat.etat != 0 {
+            return r#"<PlaylistAdd result="OK" />"#.into();
+        }
+        if vide {
             etat.playlist.clear();
             etat.courante = 0;
         }
@@ -108,7 +128,12 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
     if ligne.starts_with("<Play ") || ligne.starts_with("<Play/") {
         etat.etat = 2;
     } else if ligne.starts_with("<Stop") {
-        etat.etat = 0;
+        if etat.n_arrete_jamais || etat.status_avant_arret > 0 {
+            etat.etat = 3;
+            etat.restant_avant_arret = etat.status_avant_arret;
+        } else {
+            etat.etat = 0;
+        }
     }
     let nom: String = ligne
         .trim_start_matches('<')
@@ -207,6 +232,17 @@ impl FauxHqplayer {
 
     pub(crate) fn sans_uri(&self) {
         self.etat.lock().unwrap().annonce_uri = false;
+    }
+
+    /// #6115 — modifie l'état du faux avant l'essai.
+    pub(crate) fn regler(&self, f: impl FnOnce(&mut EtatFaux)) {
+        f(&mut self.etat.lock().unwrap());
+    }
+
+    /// #6115 — l'URI que le faux HQPlayer joue, et son état (0, 1, 2, 3).
+    pub(crate) fn joue(&self) -> (Option<String>, u8) {
+        let e = self.etat.lock().unwrap();
+        (e.playlist.get(e.courante).cloned(), e.etat)
     }
 }
 
