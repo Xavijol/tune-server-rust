@@ -4724,9 +4724,9 @@ fn le_repli_dsd_a_176_4_se_lit_dans_le_chemin_du_signal_4354() {
     let (backend, mut zone) = dlna_zone();
     // Un identifiant propre : le repli vit dans un registre global, partagé
     // par les tests de ce binaire.
-    zone.id = Some(4354_11);
+    zone.id = Some(435411);
     tune_core::audio::repli_dsd_4354::enregistrer(
-        4354_11,
+        435411,
         tune_core::audio::repli_dsd_4354::RepliDsd {
             de_hz: 352_800,
             vers_hz: 176_400,
@@ -4741,7 +4741,7 @@ fn le_repli_dsd_a_176_4_se_lit_dans_le_chemin_du_signal_4354() {
         Some(&wire_mime("wav", "audio/wav", 176_400, 24)),
     )
     .unwrap();
-    tune_core::audio::repli_dsd_4354::oublier(4354_11);
+    tune_core::audio::repli_dsd_4354::oublier(435411);
 
     let etape = transcoder(&sp).expect("une étape Transcoder");
     assert_eq!(
@@ -4768,7 +4768,7 @@ fn le_repli_dsd_a_176_4_se_lit_dans_le_chemin_du_signal_4354() {
 #[test]
 fn sans_repli_l_etape_dsd_ne_porte_aucune_raison_4354() {
     let (backend, mut zone) = dlna_zone();
-    zone.id = Some(4354_12);
+    zone.id = Some(435412);
     let sp = build_signal_path(
         &dsd128_playing(),
         &zone,

@@ -203,8 +203,8 @@ mod tests {
 
     #[test]
     fn le_repli_plafonne_la_cadence_de_la_zone_seulement() {
-        let zone = -4354_001;
-        let autre = -4354_002;
+        let zone = -4_354_001;
+        let autre = -4_354_002;
         enregistrer(
             zone,
             RepliDsd {

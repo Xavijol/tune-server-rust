@@ -158,7 +158,7 @@ async fn envoyer_un_dsd128_decime(
 /// lance PAS le renderer, pose le repli de la zone et demande de rejouer.
 #[tokio::test]
 async fn un_dsd128_trop_lent_pour_le_pre_tampon_pose_un_repli_a_176_4_4354() {
-    let zone_id = 4354_01;
+    let zone_id = 435401;
     // 352 800 × 3 × 2 = 2 116 800 octets/s requis ; on en livre ~10 %.
     let ((envoye, message), plays) =
         envoyer_un_dsd128_decime(zone_id, "dlna-4354-lent", 211_680).await;
@@ -189,7 +189,7 @@ async fn un_dsd128_trop_lent_pour_le_pre_tampon_pose_un_repli_a_176_4_4354() {
 /// barrière ; le flux part tel quel, sans repli.
 #[tokio::test]
 async fn un_dsd128_qui_tient_la_cadence_part_a_352_8_sans_repli_4354() {
-    let zone_id = 4354_02;
+    let zone_id = 435402;
     let ((envoye, message), plays) =
         envoyer_un_dsd128_decime(zone_id, "dlna-4354-rapide", 4_233_600 * 4).await;
 
@@ -238,7 +238,7 @@ fn ecrire_dsf128(path: &std::path::Path, blocs_par_canal: usize) {
 /// 176,4 kHz ; sans repli, elle se résout à 352,8 kHz (témoin).
 #[tokio::test]
 async fn apres_le_repli_le_dsd128_se_resout_a_176_4_4354() {
-    let zone_id = 4354_03;
+    let zone_id = 435403;
     let renderer = "dlna-4354-resolution";
     let orch = orchestrateur();
     let zone_id = zone_dlna(&orch, renderer, zone_id).await;
@@ -289,7 +289,7 @@ async fn apres_le_repli_le_dsd128_se_resout_a_176_4_4354() {
 /// ce second passage serait avalé.
 #[tokio::test]
 async fn par_play_la_piste_est_rejouee_une_fois_a_176_4_4354() {
-    let zone_id = 4354_04;
+    let zone_id = 435404;
     let renderer = "dlna-4354-bout-en-bout";
     let orch = orchestrateur();
     let zone_id = zone_dlna(&orch, renderer, zone_id).await;
