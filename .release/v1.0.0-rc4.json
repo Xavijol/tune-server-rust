@@ -1,6 +1,6 @@
 {
   "version": "1.0.0-rc4",
-  "ready": false,
+  "ready": true,
   "prerelease": false,
   "components": {
     "server": {
@@ -10,17 +10,17 @@
     },
     "web": {
       "repository": "renesenses/tune-web-client",
-      "sha": "6309565045b7e3d9aeab8234f7115ae7634f4434",
+      "sha": "c054c741876f6e9cb849925a8c68ef1017f04270",
       "tag": "v1.0.0-rc4"
     },
     "os": {
       "repository": "renesenses/tune-os",
-      "sha": "07169df8565ef3f9427e9ee2fe7bc45e9a21b659",
+      "sha": "a0d4933d91ee204b5c30d4cd03757ee026d0cfd3",
       "tag": "tune-os-rpi-v1.0.0-rc4"
     },
     "universal": {
       "repository": "renesenses/tune-server-universal",
-      "sha": "cbb8a355eddb039ba8014bc5e0c355fc5e2084be",
+      "sha": "723476361658063f6e9131257082ff7293fa9d07",
       "tag": "v1.0.0-rc4"
     }
   }
