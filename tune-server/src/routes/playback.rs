@@ -5925,7 +5925,7 @@ async fn do_transfer(
     if target_device.is_none() {
         // Zone sans appareil côté serveur (navigateur) : c'est l'état qui porte
         // la lecture, le client la reprend de là.
-        state.playback.play(target_zone, np).await;
+        state.playback.play(target_zone, np.clone()).await;
     }
     // 🔴 L'état de la cible n'est PAS posé avant l'orchestrateur quand un
     // appareil l'attend. `playback.play` la marquait « en lecture » sur le même
@@ -5933,65 +5933,24 @@ async fn do_transfer(
     // `RETAP_DEDUP_WINDOW` et rendait la main sans rien envoyer
     // (`orchestrator_play_retap_deduped_same_inflight_track`). Mesuré sur la .18
     // le 17/09/2026 : Eversolo → Décodeur TV, rien sur la cible, source arrêtée.
-    if let Some(ref did) = target_device {
-        match state
+    // #5050 (fil 2236) — lancement, repositionnement et pause sur l'appareil
+    // cible : `PlaybackOrchestrator::transferer_sur_l_appareil`. Une source en
+    // pause n'est plus lancée sur la cible : celle-ci est posée en pause à la
+    // même position, sans rien envoyer à l'appareil.
+    if let Some(ref did) = target_device
+        && let Err(error) = state
             .orchestrator
-            .play_from_queue(target_zone, current.queue_position)
+            .transferer_sur_l_appareil(
+                target_zone,
+                did,
+                current.queue_position,
+                &np,
+                source_position_ms,
+                source_paused,
+            )
             .await
-        {
-            Ok(_) => {
-                // Reprendre à la position de la source. Sous 3 s on repart du
-                // début (même seuil que la route seek) — inutile de chercher
-                // dans un flux qui vient de démarrer.
-                // #4442 — pas un `seek` nu dans la foulée du `Play` : voir
-                // `reprendre_la_position_transferee`.
-                if source_position_ms > 3000
-                    && let Err(error) = state
-                        .orchestrator
-                        .reprendre_la_position_transferee(
-                            target_zone,
-                            did,
-                            source_position_ms,
-                            !source_paused,
-                        )
-                        .await
-                {
-                    // Un `Seek` REFUSÉ par l'appareil (701/710/711) ne doit
-                    // pas couper le transfert en son milieu : la cible joue
-                    // déjà, depuis le début de la piste. Arrêter là laissait
-                    // la source jouer aussi, et la file de la cible non
-                    // enregistrée. Tout autre échec garde l'ancienne conduite.
-                    if tune_core::orchestrator::PlaybackOrchestrator::message_deplacement_refuse(
-                        &error,
-                    )
-                    .is_none()
-                    {
-                        return output_command_error_response(error);
-                    }
-                    tracing::warn!(
-                        target_zone,
-                        position_ms = source_position_ms,
-                        error = %error,
-                        "transfert_seek_refuse_cible_joue_depuis_le_debut"
-                    );
-                }
-                // Une source en pause reste en pause sur la cible : transférer
-                // ne veut pas dire relancer.
-                if source_paused {
-                    info!(
-                        zone_id = target_zone,
-                        origine = "transfert",
-                        "pause_requested"
-                    );
-                    if let Err(error) = state.orchestrator.pause(target_zone, Some(did)).await {
-                        return output_command_error_response(error);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(target_zone, error = %e, "transfer_play_on_target_failed");
-            }
-        }
+    {
+        return output_command_error_response(error);
     }
 
     if stop_source {
