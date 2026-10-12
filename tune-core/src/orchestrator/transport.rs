@@ -830,6 +830,16 @@ impl PlaybackOrchestrator {
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
         if !is_local {
+            // #6130 — sortie DLNA qui jouait une radio : `Stop`, puis attendre
+            // que le renderer ait lâché la connexion de la radio (au plus 2 s),
+            // AVANT de fermer la session et de poser la nouvelle URI.
+            self.sortir_de_la_radio_dlna(
+                req.zone_id,
+                req.output_device_id.as_deref(),
+                prev_state.now_playing.as_ref(),
+                &sessions_a_fermer,
+            )
+            .await;
             for sid in &sessions_a_fermer {
                 self.streamer.remove_session(sid).await;
             }
