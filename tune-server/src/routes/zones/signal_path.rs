@@ -1164,7 +1164,26 @@ fn assembler_les_etapes(
     // back to WAV) — otherwise the path claimed a bit-perfect passthrough that
     // isn't happening (LHC: renderer shows WAV 16/44 while Tune showed ALAC→FLAC;
     // Sevy: LHC-52 served WAV while Tune showed ALAC→FLAC).
-    let wire_transcode = wire_wav && !matches!(format_name, "WAV");
+    //
+    // #6166 (Gilles, fil 2228) — SAUF sur une sortie locale : là, le WAV n'est
+    // pas un format servi à un appareil, c'est le format de passage interne
+    // entre le décodeur et la sortie (`resolve_local.rs`, `local_needs_wav`) :
+    // des échantillons i32 calés à gauche, toujours en 32 bits. Élargir un
+    // 16 ou un 24 bits en 32 bits par des zéros ne touche aucun échantillon.
+    // Le présenter comme « FLAC 44kHz/24bit → FLAC 44kHz/32bit » faisait lire
+    // un suréchantillonnage, et la règle LPCM 16 bits du DLNA, appliquée à ce
+    // conteneur, le peignait en vert en 16 bits et en orange en 24 bits. Le
+    // DSD garde son étape : sur une sortie locale, le DoP et la décimation
+    // en PCM sont de vraies transformations du flux (#2029). Seul le
+    // conteneur 32 bits à la cadence de la source est reconnu : un fil WAV
+    // 16 bits (radio tronquée, #4346) ou à une autre cadence (plafond de
+    // fréquence) reste une vraie conversion, et garde son étape.
+    let conteneur_local_interne = wire_wav
+        && output_type == "local"
+        && !is_dsd
+        && wire_bit_depth == Some(32)
+        && wire_sample_rate.is_none_or(|r| r as i64 == sample_rate as i64);
+    let wire_transcode = wire_wav && !matches!(format_name, "WAV") && !conteneur_local_interne;
     let transcode_active = needs_transcode_for_output
         || oaat_transcodes
         // AirPlay 2 encode en ALAC 44,1/16 comme AirPlay 1 : l'étape est la
@@ -1185,7 +1204,9 @@ fn assembler_les_etapes(
         // WAV/LPCM output likewise preserves the samples only when the source
         // already fits the 16-bit LPCM cap — unless the zone opted into genuine
         // 24-bit WAV (`dlna_wav24`), which keeps the full depth.
-        let wav_output = wire_wav || dlna_force_wav;
+        // #6166 — le conteneur interne d'une sortie locale n'est pas un WAV
+        // servi : la règle du plafond LPCM 16 bits ne le juge pas.
+        let wav_output = (wire_wav && !conteneur_local_interne) || dlna_force_wav;
         // #4350 — seule, la réécriture d'un FLAC ffmpeg est un FLAC → FLAC sans
         // perte : mêmes échantillons, conteneur neuf. Toute autre cause
         // (plafond 16 bits, WAV forcé) garde son propre verdict.
