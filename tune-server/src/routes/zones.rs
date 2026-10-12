@@ -492,6 +492,13 @@ pub fn router() -> Router<AppState> {
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
         // DUP-1 (phase 1) : fusion explicite de deux zones du même appareil.
         .route("/{id}/fusionner-dans/{cible}", post(fusionner_zones))
+        // #6120 — rattacher à la main une zone orpheline à une sortie ASIO
+        // présente (la ré-association automatique refuse ASIO, à bon droit).
+        .route(
+            "/{id}/rattacher",
+            get(rattacher_asio_6120::candidats_au_rattachement)
+                .post(rattacher_asio_6120::rattacher_zone),
+        )
         .route("/{id}/volume", put(update_volume))
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
@@ -587,6 +594,7 @@ pub use dsp::*;
 mod lecture;
 pub use lecture::*;
 mod presence;
+mod rattacher_asio_6120;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
@@ -1595,6 +1603,9 @@ mod signal_path_pure_replaygain_5633_tests;
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]
 mod signal_path_gain_sortie_4384_tests;
+// #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
+#[cfg(test)]
+mod signal_path_conteneur_local_6166_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
