@@ -1785,6 +1785,8 @@ mod transport;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
+mod sortie_de_radio_dlna_6130;
 // #6130 — le contexte d'un flux de conversion, pour son journal.
 mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
@@ -2152,6 +2154,10 @@ mod seek_de_reprise_caduc_5476;
 /// renderer qui n'est pas à la position de la pause.
 #[cfg(test)]
 mod seek_de_reprise_conditionnel_5050;
+/// #6130 — quitter une radio sur une sortie DLNA : `Stop`, attente du départ
+/// du consommateur radio, puis `SetAVTransportURI`.
+#[cfg(test)]
+mod sortie_de_radio_dlna_6130_tests;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
