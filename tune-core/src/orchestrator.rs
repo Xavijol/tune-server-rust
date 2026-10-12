@@ -2008,6 +2008,10 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod double_dsp_dsf_aac_sortie_locale_tests;
 
+/// #6221 — un DST vers un renderer qui annonce le DSD part en DSF natif
+/// fabriqué à la volée ; sans DSD annoncé, en PCM comme avant.
+#[cfg(test)]
+mod dst_en_dsf_6221_tests;
 /// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]

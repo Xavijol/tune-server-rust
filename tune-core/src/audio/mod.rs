@@ -46,6 +46,9 @@ mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
 pub mod dsf;
+pub mod dsf_depuis_dst;
+#[cfg(test)]
+mod dsf_depuis_dst_tests_6221;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
