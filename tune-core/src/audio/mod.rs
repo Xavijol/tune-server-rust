@@ -109,6 +109,7 @@ pub mod pipeline;
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
 pub mod replaygain;
+pub mod repli_dsd_4354;
 pub mod resample;
 /// Runtime provisioning of the onnxruntime shared lib (`load-dynamic`).
 #[cfg(feature = "audio-embedding")]

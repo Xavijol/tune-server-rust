@@ -1275,6 +1275,19 @@ fn assembler_les_etapes(
             etape["code"] = json!("dop");
         }
         marquer_codec_inconnu(&mut etape);
+        // #4354 — la zone est retombée à 176,4 kHz parce que la conversion DSD
+        // n'a pas rempli son pré-tampon : l'étape dit pourquoi elle sert moins
+        // que la cadence habituelle. Seulement quand le fil est bien à la
+        // cadence de repli : un repli posé ne se prête pas à une autre piste.
+        if is_dsd
+            && !dop_sur_le_fil
+            && let Some(repli) =
+                tune_core::audio::repli_dsd_4354::repli_de_la_zone(zone.id.unwrap_or(0))
+            && i64::from(out_sample_rate) == i64::from(repli.vers_hz)
+        {
+            etape["code"] = json!("dsd_pcm_repli");
+            etape["detail"] = json!(repli.raison());
+        }
         if flac_ffmpeg_vers_le_reseau {
             // Le POURQUOI, lisible et stable : sans lui, un FLAC → FLAC de
             // même résolution ressemble à une erreur d'affichage.
