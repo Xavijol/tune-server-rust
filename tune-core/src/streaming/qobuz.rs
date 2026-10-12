@@ -1513,6 +1513,59 @@ impl QobuzService {
         }
     }
 
+    /// #6063 — le type de sortie d'un album Qobuz : celui que Qobuz annonce
+    /// (`release_type`), corrigé par le titre et la règle des pistes quand
+    /// Qobuz dit « album » ou ne dit rien
+    /// ([`crate::metadata::release_type::type_d_album_de_service`]).
+    ///
+    /// Les pistes : `tracks_count` et `duration` (secondes), présents dans
+    /// `album/get` comme dans les listes. La piste la plus longue n'est
+    /// connue que si la réponse porte `tracks.items` (`album/get`) ; dans une
+    /// liste, on prend la durée MOYENNE, qui en est un minorant : une piste
+    /// de plus de 10 min cachée dans un disque court y échappe (limite dite).
+    fn type_de_sortie(
+        item: &serde_json::Value,
+    ) -> Option<crate::metadata::release_type::TypeDeSortie> {
+        use crate::metadata::release_type::{
+            PistesDuDisque, depuis_service, type_d_album_de_service,
+        };
+        // Le champ que Qobuz rend pour SON classement (relevé le 12/10/2026 sur
+        // « Riverside EP » : `release_type: "single"`, `product_type:
+        // "single"`, dans `album/get` seulement). `epmini` est le mot de
+        // Qobuz pour un EP court ; `product_type` sert quand `release_type`
+        // manque.
+        let annonce = ["release_type", "product_type"].iter().find_map(|cle| {
+            let brut = item[*cle].as_str()?;
+            if brut.eq_ignore_ascii_case("epmini") {
+                return Some(crate::metadata::release_type::TypeDeSortie::Ep);
+            }
+            depuis_service(brut)
+        });
+        let nombre = item["tracks_count"].as_u64().unwrap_or(0);
+        let duree_ms = item["duration"].as_u64().unwrap_or(0) * 1000;
+        let pistes = (nombre > 0 && duree_ms > 0).then(|| {
+            let plus_longue = item["tracks"]["items"]
+                .as_array()
+                .filter(|items| !items.is_empty())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|t| t["duration"].as_u64())
+                        .max()
+                        .unwrap_or(0)
+                        * 1000
+                })
+                .unwrap_or(duree_ms / nombre);
+            PistesDuDisque {
+                nombre: u32::try_from(nombre).unwrap_or(u32::MAX),
+                duree_totale_ms: duree_ms,
+                durees_inconnues: 0,
+                piste_la_plus_longue_ms: plus_longue,
+            }
+        });
+        type_d_album_de_service(annonce, item["title"].as_str().unwrap_or(""), pistes)
+    }
+
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             // #4767 — le type que QOBUZ annonce pour SON album. C'est lui
@@ -1521,10 +1574,12 @@ impl QobuzService {
             // vocabulaire (`compilation`, `epMini`…) reste inconnu plutôt que
             // replié sur `album` — un tri faux est pire qu'une section
             // absente.
-            release_type: item["release_type"]
-                .as_str()
-                .and_then(crate::metadata::release_type::depuis_service)
-                .map(|t| t.as_str().to_string()),
+            //
+            // #6063 — mais un « album » annoncé, ou l'absence de type (la
+            // liste `artist/get?extra=albums` n'en porte AUCUN), laisse le
+            // titre et la règle des pistes parler : voir
+            // `type_d_album_de_service`.
+            release_type: Self::type_de_sortie(item).map(|t| t.as_str().to_string()),
             id: item["id"]
                 .as_str()
                 .map(Into::into)
@@ -4231,6 +4286,115 @@ mod tests {
             "tracks",
         );
         assert!(sans.get("album_ai_generated").is_none(), "{sans}");
+    }
+
+    /// #6063 — « Riverside EP » d'Agnes Obel (exemple de FabienM, fil 2236).
+    /// Réponses de l'API Qobuz publique enregistrées le 12/10/2026, réduites
+    /// aux champs lus : `artist/get?artist_id=…&extra=albums` (la liste de la
+    /// discographie : AUCUN `release_type`) et `album/get?album_id=…`
+    /// (`release_type: "single"`).
+    ///
+    /// Contre-épreuve : rendre à `map_album` le seul `depuis_service` fait
+    /// tomber `riverside_ep_de_la_discographie_qobuz_est_un_ep` (`None`).
+    const RIVERSIDE_LISTE: &str =
+        include_str!("../../tests/fixtures/qobuz/artist_get_albums_agnes_obel_6063.json");
+    const RIVERSIDE_ALBUM_GET: &str =
+        include_str!("../../tests/fixtures/qobuz/album_get_riverside_ep_6063.json");
+
+    fn riverside_dans_la_liste() -> serde_json::Value {
+        let liste: serde_json::Value = serde_json::from_str(RIVERSIDE_LISTE).unwrap();
+        liste["albums"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["title"] == "Riverside EP")
+            .cloned()
+            .expect("Riverside EP est dans la discographie enregistrée")
+    }
+
+    #[test]
+    fn riverside_ep_de_la_discographie_qobuz_est_un_ep() {
+        let brut = riverside_dans_la_liste();
+        assert!(
+            brut.get("release_type").is_none(),
+            "prémisse : la liste ne porte aucun type"
+        );
+        let album = QobuzService::map_album(&brut);
+        assert_eq!(album.release_type.as_deref(), Some("ep"));
+    }
+
+    #[test]
+    fn riverside_ep_garde_le_single_annonce_par_album_get() {
+        let brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        assert_eq!(
+            brut["release_type"], "single",
+            "prémisse : ce que Qobuz rend"
+        );
+        assert_eq!(
+            brut["product_type"], "single",
+            "prémisse : ce que Qobuz rend"
+        );
+        let album = QobuzService::map_album(&brut);
+        assert_eq!(
+            album.release_type.as_deref(),
+            Some("single"),
+            "le single du service est gardé"
+        );
+    }
+
+    /// La même réponse, annoncée « album » : la règle l'emporte (variante
+    /// construite à partir de l'enregistrement, Qobuz ne la sert pas pour ce
+    /// disque).
+    #[test]
+    fn un_ep_annonce_album_par_qobuz_reste_un_ep() {
+        let mut brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        brut["release_type"] = json!("album");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("ep")
+        );
+        brut["title"] = json!("Riverside");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("single"),
+            "3 titres, 11 min 33 : la règle de #5616"
+        );
+    }
+
+    /// Le classement de Qobuz est lu là où il est : `release_type`, à défaut
+    /// `product_type`, et `epmini` (le mot de Qobuz pour un EP) donne un EP.
+    #[test]
+    fn le_classement_de_qobuz_est_lu_dans_release_type_puis_product_type() {
+        let mut brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        brut.as_object_mut().unwrap().remove("release_type");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("single"),
+            "product_type seul"
+        );
+        brut["release_type"] = json!("epmini");
+        brut["title"] = json!("Riverside");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("ep")
+        );
+    }
+
+    /// Les vrais albums de la discographie enregistrée ne bougent pas : rien
+    /// n'est inventé pour eux.
+    #[test]
+    fn les_albums_de_la_discographie_enregistree_restent_sans_type() {
+        let liste: serde_json::Value = serde_json::from_str(RIVERSIDE_LISTE).unwrap();
+        for titre in ["Aventine", "Philharmonics", "Citizen of Glass", "Myopia"] {
+            let brut = liste["albums"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["title"] == titre && a["tracks_count"].as_u64() > Some(6))
+                .cloned()
+                .unwrap_or_else(|| panic!("{titre} absent de l'enregistrement"));
+            assert_eq!(QobuzService::map_album(&brut).release_type, None, "{titre}");
+        }
     }
 
     #[test]
