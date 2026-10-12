@@ -782,9 +782,10 @@ impl OutputTarget for HqplayerOutput {
         self.enchainement().suivante = None;
 
         // #6115 — un AUTRE titre alors qu'une piste joue ou est en pause :
-        // HQPlayer d'abord arrêté, sinon il ignore `clear="1"` et reste sur
-        // le titre précédent. L'enchaînement sans blanc (#4851) ne passe pas
-        // par ici (`set_next_media`, `clear="0"`) et n'est pas touché.
+        // HQPlayer d'abord arrêté — `PlaylistClear` garde la piste qui JOUE
+        // et un `Play` sur un moteur qui joue ne change rien (pont LMS, moteur
+        // 6.0.4). L'enchaînement sans blanc (#4851) ne passe pas par ici
+        // (`set_next_media`, `clear="0"`) et n'est pas touché.
         let etat = *self.dernier_etat();
         if matches!(
             etat,
@@ -801,10 +802,24 @@ impl OutputTarget for HqplayerOutput {
         // hit the 5s read timeout and fail the play. `action` writes and only
         // briefly drains any v4/v5 ack. See `send_action` for the full rationale.
         //
-        // This is the only place that puts TWO commands on one control
+        // This is the only place that puts SEVERAL commands on one control
         // connection, which is why #4023 showed up here and nowhere else: the
         // second one must NOT be preceded by another XML declaration, or
         // HQPlayer's stream parser dies on it and `Play` is never executed.
+
+        // #6115 (suite) — vider la playlist par un `PlaylistClear` EXPLICITE,
+        // quel que soit l'état, arrêt compris (Piero, fil 2240 : « even if I
+        // stop the previous one »). `clear="1"` seul ne suffit pas : le pont
+        // LMS-HQPlayer de Simon Arnold l'a mesuré ignoré par le moteur 6.0.4
+        // (`PlaylistAdd` répond OK et AJOUTE), la playlist devient
+        // [précédent, nouveau] et `Play` repart sur l'entrée courante, le
+        // précédent. Son chargement vérifié en direct est `Stop`,
+        // `PlaylistClear`, `PlaylistAdd`, `Play`. `clear="1"` reste écrit :
+        // c'est l'orthographe documentée, et il ne coûte rien.
+        self.action("<PlaylistClear />").await.map_err(|e| {
+            warn!(error = %e, "hqplayer_playlist_clear_failed");
+            e
+        })?;
 
         // Add URI to playlist (clear existing, start playing)
         let xml = format!(
