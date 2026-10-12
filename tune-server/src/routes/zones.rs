@@ -319,6 +319,13 @@ fn inject_device_identity(
         .flatten()
         .filter(|v| !v.trim().is_empty());
     obj.insert("image_path".into(), json!(image_path));
+    // #2109 — la photo affichée a-t-elle été proposée au catalogue ? La clef
+    // est TOUJOURS présente (`null` = locale) : un client y lit aussi que ce
+    // serveur sait proposer une photo.
+    obj.insert(
+        "image_share_status".into(),
+        json!(peripheriques::etat_partage_photo(&settings, zone_id)),
+    );
     let trim = settings
         .get(&format!("zone_{zone_id}_gain_trim_db"))
         .ok()
@@ -512,6 +519,9 @@ pub fn router() -> Router<AppState> {
             "/{id}/image",
             post(zone_image_upload).delete(zone_image_delete),
         )
+        // #2109 — proposer cette photo au catalogue communautaire, sur accord
+        // explicite seulement.
+        .route("/{id}/image/share", post(zone_image_share))
         .route("/{id}/name", put(rename_zone))
         // #1361 — l'album de ce qui joue, et chez qui l'ouvrir, en UNE
         // réponse. Deux orthographes pour la même route : le dépôt en est à
