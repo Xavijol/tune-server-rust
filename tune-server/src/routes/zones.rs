@@ -1585,6 +1585,9 @@ mod signal_path_pure_replaygain_5633_tests;
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
 #[cfg(test)]
 mod signal_path_gain_sortie_4384_tests;
+// #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
+#[cfg(test)]
+mod signal_path_conteneur_local_6166_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
