@@ -51,6 +51,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_heartbeat(state);
     spawn_bio_sync(state);
     spawn_reprise_favoris_streaming(state);
+    spawn_veille_favoris_miroir(state);
     // CRD-5 : passe automatique des crédits, bornée par tour et reprenable par
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
@@ -64,6 +65,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_radio_logo_refresh(state);
     spawn_rattrapage_vignettes_podcasts(state);
     spawn_cloud_library_sync(state);
+    // Sauvegarde cloud automatique des personnalisations (#5654). Un test de
+    // câblage garde la ligne.
+    crate::routes::system::sauvegarde_cloud::spawn(state);
     spawn_local_audio_rescan(state);
     // Scan programmé (#2469). Cet appel manquait depuis la PR #1230 :
     // `spawn_scan_scheduler` était du code mort, la bascule des clients écrivait
@@ -2481,6 +2485,50 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
     });
 }
 
+/// La veille du miroir des favoris de service (#5997) : toutes les
+/// `TUNE_FAVORIS_MIROIR_PERIODE_S` (300 s par défaut, `0` la coupe), chaque
+/// service en miroir connecté est relu, réconcilié, et ses écritures en
+/// attente poussées. Un favori posé ou retiré dans l'application du service
+/// arrive ainsi dans Tune sans redémarrage, même écran fermé.
+///
+/// Le premier passage reste celui de [`spawn_reprise_favoris_streaming`], 90 s
+/// après le démarrage ; la veille commence une période plus tard.
+fn spawn_veille_favoris_miroir(state: &AppState) {
+    let Some(periode) = tune_core::streaming::favorites_mirror::periode() else {
+        info!("veille_favoris_miroir_coupee");
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(REPRISE_FAVORIS_DELAI_SECS)).await;
+        loop {
+            tokio::time::sleep(periode).await;
+            let profil =
+                tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+                    .get("active_profile_id")
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.trim().parse::<i64>().ok())
+                    .filter(|&id| id > 0)
+                    .unwrap_or(1);
+            let mut connectes = Vec::new();
+            for (nom, arc) in crate::routes::profiles::services_en_miroir(&state).await {
+                if arc.read().await.utilisable().await {
+                    connectes.push((nom, arc));
+                }
+            }
+            crate::routes::profiles::rafraichir_les_miroirs(
+                &state,
+                &connectes,
+                profil,
+                false,
+                std::time::Duration::from_secs(120),
+            )
+            .await;
+        }
+    });
+}
+
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -2799,6 +2847,37 @@ pub async fn any_local_output_playing(state: &AppState) -> bool {
     }
     false
 }
+
+/// #6119 — le parc local à PUBLIER (fiche de diagnostic, `GET /devices/audio`),
+/// sans jamais sonder le matériel pendant qu'une sortie locale joue.
+///
+/// Gros Bidon (fil 2216, 1.0.0-rc3, Windows, SMSL SU-8 en WASAPI, backend
+/// ASIO choisi) : ouvrir la page Zones coupait la lecture, deux fois de suite.
+/// La page appelle `GET /system/diagnostics`, qui énumérait les sorties avec
+/// le backend affiché, donc ASIO : `select_host("asio")` charge chaque pilote
+/// ASIO, celui du SU-8 prend l'appareil, et le flux WASAPI qui jouait meurt
+/// (`audio_stream_device_lost` 10 ms avant `local_audio_host_selected
+/// backend="asio"`). `GET /devices/audio` se gardait déjà ainsi (DEvir) ; la
+/// fiche de diagnostic, non. Les deux passent désormais par ici.
+#[cfg(feature = "local-audio")]
+pub async fn parc_local_sans_couper_la_lecture<F, Fut>(
+    state: &AppState,
+    enumerer: F,
+) -> Vec<tune_core::outputs::local::AudioDevice>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Vec<tune_core::outputs::local::AudioDevice>>,
+{
+    if any_local_output_playing(state).await {
+        tune_core::outputs::local::cached_audio_devices()
+    } else {
+        enumerer().await
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "parc_local_pendant_la_lecture_6119_tests.rs"]
+mod parc_local_pendant_la_lecture_6119_tests;
 
 /// Whether ANY zone (local or network) is currently playing, read from the
 /// in-memory playback state — no device or network probing. Used on Linux to
@@ -3378,6 +3457,21 @@ mod tests_licence_proprietaire_battement {
                  serveur serait refixe toutes les heures sur le dernier compte lie"
             );
         }
+    }
+
+    /// #5654 — sans cet appel, la sauvegarde automatique serait du code mort :
+    /// l'écran dirait « active » et rien ne partirait jamais.
+    #[test]
+    fn la_sauvegarde_cloud_automatique_est_lancee() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        assert!(
+            source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
+            "la passe de sauvegarde cloud n'est plus lancee au demarrage"
+        );
     }
 
     /// Meme garde d'ordre que dans `cloud.rs` : l'adoption doit lire le compte

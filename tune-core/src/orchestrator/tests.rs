@@ -1961,7 +1961,10 @@ fn les_seeks_apres_reprise_sont_detaches_et_gardes() {
         &apres[..fin]
     };
     for (nom, sig) in [
-        ("resume", "pub async fn resume_with_session_error_message("),
+        // #6062 — le corps de `resume_with_session_error_message` vit
+        // désormais dans `reprendre` (second passage après un refus de la
+        // sortie) : c'est lui que la garde lit.
+        ("resume", "    async fn reprendre(\n"),
         (
             "seek_output_after_replay",
             "pub(super) async fn seek_output_after_replay(",
@@ -3521,7 +3524,13 @@ async fn pcm_retenu_passthrough(
         tokio::sync::mpsc::unbounded_channel::<crate::audio::tap::RawWindow>();
 
     let (sink_tx, decode_tx) = if freine {
-        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx)
+        // Personne ne draine la file : rien n'est consommé (#3818).
+        super::spawn_braked_levels_sink(
+            orch.playback.clone(),
+            zone_id,
+            levels_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        )
     } else {
         // Forme d'origine : le puits draine sans condition, et le décodeur
         // écrit DIRECTEMENT dans la file du forwarder.
@@ -3679,10 +3688,15 @@ async fn un_passthrough_bride_fait_toujours_monter_des_niveaux_sur_le_bus() {
 
     // Génération épinglée AVANT le spawn, comme dans la branche (#1110).
     let play_seq = orch.playback.current_play_seq(zone_id).await;
-    let levels_tx =
-        super::spawn_paced_levels_forwarder(bus, orch.playback.clone(), zone_id, play_seq, 0);
+    let (levels_tx, consomme_ms) = super::spawn_paced_levels_forwarder_mesure(
+        bus,
+        orch.playback.clone(),
+        zone_id,
+        play_seq,
+        0,
+    );
     let (sink_tx, relais_tx) =
-        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx);
+        super::spawn_braked_levels_sink(orch.playback.clone(), zone_id, levels_tx, consomme_ms);
     let ready = std::sync::Arc::new(tokio::sync::Notify::new());
     tokio::task::spawn_blocking(move || {
         crate::audio::decode::decode_to_pcm_streaming_with_levels(
@@ -6692,6 +6706,7 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
                 track_number: None,
                 disc_number: None,
                 album_ref: Some(PAGE.into()),
+                artist_ref: None,
             }],
         )
         .unwrap();
@@ -7056,6 +7071,136 @@ async fn zone_navigateur_l_arret_annule_l_annonce_en_attente() {
         }
     }
     assert!(!orch.confirmer_lecture_navigateur(zone_id, &sid).await);
+    assert_eq!(lignes_historique(&orch), 0);
+}
+
+// ------------------------------------------------------------------
+// #6066 — la preuve de lecture d'une zone navigateur n'est plus « un octet ».
+// ------------------------------------------------------------------
+
+async fn zone_navigateur_en_attente(
+    orch: &PlaybackOrchestrator,
+    fichier: &std::path::Path,
+    octets: u64,
+) -> (i64, String) {
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Ce téléphone", Some("browser"), None)
+        .unwrap();
+    let sid = session_navigateur(orch, fichier, octets).await;
+    orch.annonces_navigateur
+        .lock()
+        .unwrap()
+        .insert(zone_id, annonce_en_attente(&sid, true, "local"));
+    (zone_id, sid)
+}
+
+/// Le cas du terrain : AVPlayer sonde `Range: bytes=0-1`, deux octets
+/// partent, la réponse est rejetée, rien ne joue. Le journal disait pourtant
+/// `browser_playback_confirmed_announcing` et l'historique s'écrivait.
+#[tokio::test]
+async fn zone_navigateur_une_sonde_de_plage_ne_confirme_rien_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 2).await;
+
+    assert!(
+        !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+        "#6066 : deux octets tirés par une sonde de plage ont suffi à dire \
+         « en écoute » alors que rien ne jouait"
+    );
+    assert_eq!(
+        lignes_historique(&orch),
+        0,
+        "#6066 : une sonde de plage a écrit une ligne d'historique"
+    );
+    assert!(
+        orch.annonces_navigateur
+            .lock()
+            .unwrap()
+            .contains_key(&zone_id),
+        "l'annonce reste en attente : le lecteur peut encore démarrer"
+    );
+}
+
+/// La parole du lecteur : position nulle → rien ; position qui avance → la
+/// confirmation part, une fois, sans attendre le tick du sondeur.
+#[tokio::test]
+async fn zone_navigateur_le_lecteur_qui_joue_confirme_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 2).await;
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 0).await,
+        crate::orchestrator::SignalDuLecteur::PasEncoreDeLecture,
+        "un lecteur à 0 ms n'a rien fait entendre"
+    );
+    assert_eq!(lignes_historique(&orch), 0);
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 1_500).await,
+        crate::orchestrator::SignalDuLecteur::Confirmee,
+        "le lecteur de la zone dit jouer ce flux : l'annonce part"
+    );
+    assert_eq!(lignes_historique(&orch), 1);
+
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 2_500).await,
+        crate::orchestrator::SignalDuLecteur::RienEnAttente,
+        "une écoute, une annonce : le signal suivant ne doublonne pas"
+    );
+    assert_eq!(lignes_historique(&orch), 1);
+}
+
+/// Un lecteur qui a parlé fait taire le repli par les octets pour SA zone :
+/// un préchargement ou un autre client qui tire 64 Kio ne confirme plus à
+/// sa place.
+#[tokio::test]
+async fn zone_navigateur_apres_la_parole_du_lecteur_les_octets_ne_suffisent_plus_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, sid) = zone_navigateur_en_attente(&orch, &f, 0).await;
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, &sid, 0).await,
+        crate::orchestrator::SignalDuLecteur::PasEncoreDeLecture
+    );
+    {
+        let sessions = orch.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions
+            .get(&sid)
+            .unwrap()
+            .bytes_sent
+            .store(1 << 20, std::sync::atomic::Ordering::Relaxed);
+    }
+    assert!(
+        !orch.confirmer_lecture_navigateur(zone_id, &sid).await,
+        "ce lecteur sait dire quand il joue : des octets tirés ne parlent \
+         pas à sa place"
+    );
+    assert_eq!(lignes_historique(&orch), 0);
+}
+
+/// La parole d'un lecteur sur un AUTRE flux que celui en attente (lecture
+/// remplacée entre-temps) ne libère rien.
+#[tokio::test]
+async fn zone_navigateur_un_signal_sur_un_flux_perime_ne_confirme_rien_6066() {
+    let orch = test_orchestrator();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let f = tmp.path().join("piste.flac");
+    std::fs::write(&f, b"fake audio").unwrap();
+    let (zone_id, _sid) = zone_navigateur_en_attente(&orch, &f, 0).await;
+    assert_eq!(
+        orch.signaler_lecture_navigateur(zone_id, "flux-d-avant", 30_000)
+            .await,
+        crate::orchestrator::SignalDuLecteur::RienEnAttente
+    );
     assert_eq!(lignes_historique(&orch), 0);
 }
 
@@ -9963,5 +10108,111 @@ async fn une_zone_reseau_sans_opt_in_entend_le_crossfeed_sur_un_flux_2742() {
         !statut.unavailable && statut.effective,
         "le statut publié VERROUILLE un crossfeed qui s'entend : diaphonie \
          mesurée {diaphonie_db:.1} dB sur le flux, et pourtant {statut:?}"
+    );
+}
+
+/// #5522 — une session de flux ABANDONNÉE avant l'envoi ne part pas à la
+/// sortie : la zone s'arrête et le dit.
+///
+/// Le journal de Gros Bidon (fil 2212, v1.0.0-rc3) : le téléchargement Qobuz
+/// échoue, `streaming_session_abandonnee_producteur_mort` à 16:46:00.428, puis
+/// `orchestrator_play output_sent=true` à 16:46:00.606. La sortie locale tire
+/// alors `/stream/<id>.wav`, reçoit un 404, et la zone reste « en lecture »
+/// à 0:00 pendant plus de trois minutes, sans bandeau
+/// (`octets_servis_inconnus_zone_non_coupee`). La session était déjà morte
+/// AVANT l'envoi : rien ne justifiait d'envoyer.
+#[tokio::test]
+async fn une_session_abandonnee_avant_l_envoi_arrete_la_zone_au_lieu_de_jouer_un_404_5522() {
+    use crate::http::streamer::StreamInfo;
+
+    let orch = test_orchestrator();
+    let device_id = "mock-5522";
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device_id, "Sortie 5522")));
+
+    let info = StreamInfo {
+        format: "wav".to_string(),
+        mime_type: "audio/wav".to_string(),
+        ..StreamInfo::default()
+    };
+    let (morte, _tx, _ready) = orch.streamer.create_session(info, false, 1).await;
+    abandonner_la_session_de_transcodage(&orch.streamer, &morte, None).await;
+
+    let req = super::PlayRequest {
+        zone_id: 2,
+        output_device_id: Some(device_id.into()),
+        track_id: None,
+        source: Some("qobuz".into()),
+        source_id: Some("2206801".into()),
+        title: Some("Time".into()),
+        artist_name: None,
+        album_title: None,
+        cover_url: None,
+        duration_ms: Some(275_000),
+        seek_ms: None,
+        temp_file_path: None,
+        sample_rate: None,
+        bit_depth: None,
+        media_format: None,
+        track_number: None,
+        disc_number: None,
+        album_ref: None,
+    };
+    let resolved = super::ResolvedStream {
+        url: format!("http://127.0.0.1:8888/stream/{morte}.wav"),
+        mime_type: "audio/wav".into(),
+        title: "Time".into(),
+        artist: None,
+        album: None,
+        duration_ms: Some(275_000),
+        source: "qobuz".into(),
+        cover_url: None,
+        stream_id: Some(morte.clone()),
+        file_size: None,
+        sample_rate: Some(44_100),
+        bit_depth: Some(16),
+        channels: Some(2),
+        origin_url: None,
+        bitrate_kbps: None,
+    };
+    let habillage = super::transport::Habillage {
+        album: None,
+        cover_path: None,
+    };
+
+    let (output_sent, output_error) = orch
+        .envoyer_a_la_sortie(
+            &req,
+            &resolved,
+            &habillage,
+            false,
+            std::time::Instant::now(),
+            0,
+        )
+        .await;
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).unwrap();
+    let guard = out.lock().await;
+    let mock = guard
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .expect("mock output");
+    assert_eq!(
+        mock.play_call_count().await,
+        0,
+        "la session est morte avant l'envoi : la sortie ne doit rien recevoir \
+         (sinon 404 sur /stream/<id> et zone figée à 0:00)"
+    );
+    assert!(
+        !output_sent,
+        "output_sent doit être faux : c'est ce qui arrête la zone avec un bandeau"
+    );
+    let message = output_error.expect("un message pour le bandeau de la zone");
+    assert!(
+        message.contains("flux"),
+        "le message doit dire que le flux du service n'a pas pu être ouvert : {message}"
     );
 }

@@ -1,4 +1,6 @@
 pub mod active_profile;
+/// #4626 — appairage maître / agent et ordres entre serveurs Tune.
+pub mod agent_tune;
 pub mod ai;
 pub mod airplay_pairing;
 pub mod appliance;
@@ -18,6 +20,8 @@ pub mod dac_calibration;
 pub mod dashboard;
 pub mod declick;
 mod premium_audio_host;
+/// #6044 — le greffon « Réaffectation des canaux » (`/channel-remap`).
+pub mod reaffectation_canaux;
 pub use tune_streaming_http::deezer_proxy_handler;
 pub mod developer_api;
 pub mod devices;
@@ -63,7 +67,6 @@ pub mod party;
 pub mod peers;
 pub mod playback;
 pub mod playlist_manager;
-pub mod playlist_transfer;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
@@ -396,7 +399,8 @@ pub fn router_with_plugins(
     state: AppState,
     plugin_routers: crate::plugins::PluginRouters,
 ) -> Router {
-    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path);
+    let contexte_sendspin = sendspin::ContexteSendspin::pour_base(&state.config.db_path)
+        .avec_zones(sendspin::RaccordZones::depuis_etat(&state));
     let streamer_sessions = state.streamer.sessions_state();
 
     let web_dir = crate::config::resolve_web_dir()
@@ -455,6 +459,8 @@ pub fn router_with_plugins(
         .nest("/dashboard", dashboard::router())
         .nest("/digest", digest::router())
         .nest("/peers", peers::router())
+        // #4626 — gestes de l'utilisateur (code, appairage, oubli).
+        .nest("/agent-tune", agent_tune::router())
         .nest("/podcasts", podcasts::router())
         .nest("/plugins", plugins::router())
         .nest("/marketplace", marketplace::router())
@@ -462,7 +468,6 @@ pub fn router_with_plugins(
         // it mounts at /api/v1/ext/dj. The stock server no longer serves /dj.
         .nest("/party", party::router())
         .nest("/playlist-manager", playlist_manager::router())
-        .nest("/playlist-transfer", playlist_transfer::router())
         .nest("/zone-manager", zone_manager::router())
         .nest("/snapcast", snapcast::router())
         .nest("/sonos", sonos::router())
@@ -496,6 +501,8 @@ pub fn router_with_plugins(
         .nest("/eq", eq_pro::router())
         // #4684 — préréglages nommés du crossfeed, sur le modèle de `/eq/presets`.
         .nest("/crossfeed", crossfeed::router())
+        // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
+        .nest("/channel-remap", reaffectation_canaux::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())
@@ -656,6 +663,14 @@ pub fn router_with_plugins(
     app = app.nest(
         "/upnp/renderer",
         upnp_media_renderer::router().with_state(state.clone()),
+    );
+    // #4626 — ce qu'un serveur Tune demande à un autre (maître → agent). À la
+    // RACINE, hors de la couche d'authentification : un maître n'a pas de
+    // session chez l'agent. Chaque route vérifie elle-même le jeton
+    // d'appairage, sauf l'annonce publique et l'appairage gardé par le code.
+    app = app.nest(
+        "/agent-tune",
+        agent_tune::router_entre_serveurs().with_state(state.clone()),
     );
 
     // Mount all installed skins on /{skin_id}

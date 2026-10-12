@@ -69,7 +69,9 @@ impl Famille {
             Famille::Source => &["=", "!="],
             Famille::Repertoire => &["starts_with", "contains"],
             Famille::Vide => &["is_null", "is_not_null"],
-            Famille::Horodatage => &[">", "<", "between", "is_null"],
+            // #6122 — « dans les N derniers jours » (`in_last`), la durée
+            // glissante ; « après » garde sa date fixe.
+            Famille::Horodatage => &[">", "<", "between", "in_last", "is_null"],
             Famille::Credit => &["has"],
             Famille::RefCollection | Famille::RefPlaylist => &["in", "not_in"],
             Famille::Favori | Famille::Etiquette => &["is", "is_not"],
@@ -118,6 +120,12 @@ pub(crate) const CRITERES: &[Critere] = &[
         piste: Some("album"),
         famille: Famille::Texte,
     },
+    // #6121 (forum 2218) — « Artiste de l'album » : la balise ALBUMARTIST,
+    // et à défaut l'artiste de l'album. Même nom aux deux niveaux. Dans une
+    // collection, « Artiste » lit déjà l'artiste de l'album ; dans une
+    // playlist, il lit l'interprète de la PISTE — c'est là que les deux
+    // critères diffèrent.
+    deux("album_artist", Famille::Texte),
     deux("genre", Famille::Texte),
     deux("composer", Famille::Texte),
     deux("label", Famille::Texte),
@@ -125,6 +133,12 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("source", Famille::Source),
     deux("folder", Famille::Repertoire),
     deux("year", Famille::Nombre),
+    // #6124 — l'année de sortie ORIGINALE (`albums.original_year` : balises
+    // ORIGINALDATE / ORIGINALRELEASEDATE / ORIGINALYEAR / TDOR, ou
+    // MusicBrainz) et la VERSION de la piste (balise VERSION : original,
+    // réédition, remaster…, `track_metadata['version']`).
+    deux("original_year", Famille::Nombre),
+    deux("version", Famille::Texte),
     deux("sample_rate", Famille::Nombre),
     deux("bit_depth", Famille::Nombre),
     deux("track_count", Famille::Nombre),
@@ -132,7 +146,14 @@ pub(crate) const CRITERES: &[Critere] = &[
     deux("track_number", Famille::Nombre),
     deux("disc_number", Famille::Nombre),
     deux("bpm", Famille::Nombre),
+    // « Note de l'album » : la note de l'album pour le profil actif (#5547).
+    // Le nom `rating` est celui des règles déjà enregistrées : il garde ce
+    // sens-là (décision de Bertrand du 11/10, #6123).
     deux("rating", Famille::Nombre),
+    // « Note de la piste » (#6123) : la note lue dans les balises du fichier
+    // (`tracks.rating`, 0 à 5, sans profil). Dans une collection : un album
+    // dont UNE piste au moins passe la comparaison.
+    deux("track_rating", Famille::Nombre),
     deux("cover_path", Famille::Vide),
     deux("added_at", Famille::Horodatage),
     deux("credit", Famille::Credit),
@@ -185,6 +206,7 @@ pub(crate) mod tests {
         match (f, op) {
             (_, "is_null" | "is_not_null") => Value::Null,
             (Famille::Horodatage, "between") => json!(["2020-01-01", "2030-01-01"]),
+            (Famille::Horodatage, "in_last") => json!(30),
             (_, "between") => json!([1, 5]),
             (Famille::Horodatage, _) => json!("now-30d"),
             (Famille::Nombre | Famille::Compte, _) => json!(3),
@@ -364,6 +386,34 @@ pub(crate) mod tests {
             .collect()
     }
 
+    /// #6123 — « note de la piste » lit `tracks.rating`, des deux côtés ; et
+    /// « note de l'album » (`rating`) garde son sens, même quand les pistes
+    /// portent une note.
+    ///
+    /// Notes de piste posées ici : 1 → 4, 2 → 1, 3 → 5, 4 aucune.
+    #[test]
+    fn la_note_de_la_piste_marche_des_deux_cotes_6123() {
+        let db = bibliotheque();
+        db.execute_batch(
+            "UPDATE tracks SET rating = 4 WHERE id = 1; \
+             UPDATE tracks SET rating = 1 WHERE id = 2; \
+             UPDATE tracks SET rating = 5 WHERE id = 3;",
+        )
+        .unwrap();
+        let r = |op: &str, v: Value| regle("track_rating", op, v);
+        assert_eq!(pistes(&db, &r(">=", json!(4))), vec![1, 3]);
+        assert_eq!(pistes(&db, &r("<", json!(2))), vec![2]);
+        assert_eq!(pistes(&db, &r("=", json!("5"))), vec![3]);
+        // Une piste sans note ne passe aucune comparaison.
+        assert_eq!(pistes(&db, &r("between", json!([0, 5]))), vec![1, 2, 3]);
+        // Collections : l'album dont une piste passe.
+        assert_eq!(albums(&db, &r(">=", json!(4))), vec![1, 2]);
+        assert_eq!(albums(&db, &r("<", json!(2))), vec![1]);
+        // La note de l'ALBUM n'a pas bougé : Kind of Blue 5, Giant Steps 2.
+        assert_eq!(pistes(&db, &regle("rating", ">=", json!(4))), vec![1, 2]);
+        assert_eq!(albums(&db, &regle("rating", ">=", json!(4))), vec![1]);
+    }
+
     #[test]
     fn la_note_est_celle_du_profil_actif() {
         let db = bibliotheque();
@@ -421,15 +471,197 @@ pub(crate) mod tests {
         );
     }
 
-    /// Le compte du client : vingt-neuf définitions, dont vingt-sept aux
-    /// collections (#5530 : « Généré par IA »). Si ce nombre bouge,
-    /// `smartRegles.ts` doit bouger aussi.
+    /// Le compte du client : trente-trois définitions, dont trente et une aux
+    /// collections (#5530 : « Généré par IA » ; #6123 : « Note de la piste » ;
+    /// #6121 : « Artiste de l'album » ; #6124 : « Année de sortie originale »
+    /// et « Version »). Si ce nombre bouge, `smartRegles.ts` doit bouger
+    /// aussi.
     #[test]
     fn le_tableau_a_la_taille_de_celui_du_client() {
-        assert_eq!(CRITERES.len(), 29);
+        assert_eq!(CRITERES.len(), 33);
         assert_eq!(
             CRITERES.iter().filter(|c| c.collection.is_some()).count(),
-            27
+            31
+        );
+    }
+    // ---------------------------------------------------------------------
+    // #6124 — « Année de sortie originale » et « Version ».
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus : Kind of Blue sorti à l'origine en
+    /// 1959, Giant Steps en 1960 ; « Blue in Green » balisée
+    /// `VERSION=Remaster 2009`, « Giant Steps » `VERSION=Mono`.
+    fn avec_dates_et_versions() -> SqliteDb {
+        let db = bibliotheque();
+        db.execute_batch(
+            "UPDATE albums SET original_year = 1959 WHERE id = 1; \
+             UPDATE albums SET original_year = 1960 WHERE id = 2; \
+             INSERT INTO track_metadata (track_id, key, value) VALUES \
+               (1,'version','Remaster 2009'), (3,'version','Mono'), \
+               (2,'original_date','1959-08-17');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn l_annee_originale_filtre_les_deux_niveaux_6124() {
+        let db = avec_dates_et_versions();
+        assert_eq!(
+            pistes(&db, &regle("original_year", "=", json!(1959))),
+            vec![1, 2]
+        );
+        assert_eq!(
+            pistes(&db, &regle("original_year", ">", json!(1959))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("original_year", "between", json!([1950, 1965]))),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            albums(&db, &regle("original_year", "<", json!("1960"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("original_year", "between", json!("1955,1960"))),
+            vec![1, 2]
+        );
+        // Un album sans année originale ne passe aucune comparaison.
+        assert!(!pistes(&db, &regle("original_year", "!=", json!(1959))).contains(&4));
+    }
+
+    #[test]
+    fn la_version_filtre_les_deux_niveaux_6124() {
+        let db = avec_dates_et_versions();
+        assert_eq!(
+            pistes(&db, &regle("version", "=", json!("remaster 2009"))),
+            vec![1]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "contains", json!("MONO"))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "starts_with", json!("Rem"))),
+            vec![1]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "in", json!("mono, autre"))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "is_not_null", Value::Null)),
+            vec![1, 3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("version", "is_null", Value::Null)),
+            vec![2, 4]
+        );
+        // Une autre clé de `track_metadata` n'est pas la version.
+        assert!(!pistes(&db, &regle("version", "contains", json!("1959"))).contains(&2));
+        assert_eq!(
+            albums(&db, &regle("version", "contains", json!("mono"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("version", "=", json!("Remaster 2009"))),
+            vec![1]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #6121 — « Artiste de l'album » (forum 2218).
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus une COMPILATION : album 4 « Ballads »,
+    /// artiste d'album « Various Artists », pistes 5 (Bill Evans) et 6 (Miles
+    /// Davis) balisées ALBUMARTIST=Various Artists. Les pistes 1 à 4 n'ont
+    /// pas la balise : l'artiste de l'album sert de repli.
+    fn avec_compilation() -> SqliteDb {
+        let db = bibliotheque();
+        db.execute_batch(
+            "INSERT INTO artists (id, name) VALUES (4,'Various Artists'),(5,'Bill Evans'); \
+             INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Ballads',4,2); \
+             INSERT INTO tracks (id, album_id, artist_id, album_artist, title, file_path) VALUES \
+               (5,4,5,'Various Artists','Peace Piece','/m/c/5.flac'), \
+               (6,4,1,'Various Artists','Flamenco Sketches','/m/c/6.flac');",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn l_artiste_de_l_album_dans_une_collection() {
+        let db = avec_compilation();
+        assert_eq!(
+            albums(&db, &regle("album_artist", "=", json!("various artists"))),
+            vec![4]
+        );
+        // Sans balise : l'artiste de l'album répond.
+        assert_eq!(
+            albums(&db, &regle("album_artist", "=", json!("Miles Davis"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "contains", json!("VARIOUS"))),
+            vec![4]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "starts_with", json!("John"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("album_artist", "!=", json!("Various Artists"))),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            // En minuscules : le « parmi » des collections compare
+            // `LOWER(col)` aux valeurs telles quelles (défaut commun à tous
+            // les champs texte, hors de ce correctif).
+            albums(
+                &db,
+                &regle("album_artist", "in", json!("autre, various artists"))
+            ),
+            vec![3, 4]
+        );
+        assert!(albums(&db, &regle("album_artist", "is_null", Value::Null)).is_empty());
+        assert_eq!(
+            albums(&db, &regle("album_artist", "is_not_null", Value::Null)),
+            vec![1, 2, 3, 4]
+        );
+        // « Artiste » ne change pas : il lit toujours l'artiste de l'album.
+        assert_eq!(
+            albums(&db, &regle("artist_name", "=", json!("Miles Davis"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("artist", "=", json!("Various Artists"))),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn l_artiste_de_l_album_dans_une_playlist() {
+        let db = avec_compilation();
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "=", json!("Various Artists"))),
+            vec![5, 6]
+        );
+        // Une piste sans balise ALBUMARTIST prend l'artiste de son album.
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "=", json!("miles davis"))),
+            vec![1, 2]
+        );
+        assert_eq!(
+            pistes(&db, &regle("album_artist", "is_not_null", Value::Null)),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        // « Artiste » reste l'interprète de la PISTE : la piste 6 de la
+        // compilation en est.
+        assert_eq!(
+            pistes(&db, &regle("artist", "=", json!("Miles Davis"))),
+            vec![1, 2, 6]
         );
     }
 
@@ -624,6 +856,99 @@ pub(crate) mod tests {
             vec![1]
         );
     }
+
+    // ---------------------------------------------------------------------
+    // #6122 — « dans les N derniers jours » (forum 2217).
+    // ---------------------------------------------------------------------
+
+    /// La bibliothèque commune, plus des dates RÉCENTES, posées par rapport à
+    /// l'horloge du test (les dates de `bibliotheque()` datent de 2024 et
+    /// 2019) : album 4 « Récent », piste 5 dont le fichier a 5 jours ; une
+    /// écoute de la piste 3 (Giant Steps) il y a 2 jours, une de la piste 4
+    /// (Seul) il y a 40 jours.
+    fn avec_dates_recentes() -> SqliteDb {
+        let db = bibliotheque();
+        let maintenant = chrono::Utc::now();
+        let il_y_a = |j: i64| maintenant - chrono::Duration::days(j);
+        let iso = |j: i64| il_y_a(j).format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        db.execute_batch(&format!(
+            "INSERT INTO albums (id, title, artist_id, track_count) VALUES (4,'Récent',3,1); \
+             INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_mtime) VALUES \
+               (5,4,3,'Neuf','/m/neuf/5.flac',{mtime}); \
+             INSERT INTO listen_history (track_id, title, listened_at) VALUES \
+               (3,'Giant Steps','{deux}'), (4,'Solo','{quarante}');",
+            mtime = il_y_a(5).timestamp(),
+            deux = iso(2),
+            quarante = iso(40),
+        ))
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn ajoutes_dans_les_n_derniers_jours_dans_une_collection() {
+        let db = avec_dates_recentes();
+        let r = |v: Value| albums(&db, &regle("added_at", "in_last", v));
+        assert_eq!(r(json!(30)), vec![4]);
+        // La valeur en chiffres, comme l'enverrait un champ texte.
+        assert_eq!(r(json!("30")), vec![4]);
+        // Le fichier a 5 jours : hors des 3 derniers.
+        assert!(r(json!(3)).is_empty());
+        // Même ensemble que l'ancienne écriture relative « après now-30d » —
+        // qui, elle, ne change pas.
+        assert_eq!(
+            albums(&db, &regle("added_at", ">", json!("now-30d"))),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn ecoutes_dans_les_n_derniers_jours_dans_une_collection() {
+        let db = avec_dates_recentes();
+        let r = |v: Value| albums(&db, &regle("last_played_at", "in_last", v));
+        // Giant Steps, écouté il y a 2 jours ; Kind of Blue (2024) non.
+        assert_eq!(r(json!(7)), vec![2]);
+        assert_eq!(r(json!(60)), vec![2, 3]);
+        assert!(r(json!(1)).is_empty());
+    }
+
+    #[test]
+    fn dans_les_n_derniers_jours_dans_une_playlist() {
+        let db = avec_dates_recentes();
+        assert_eq!(
+            pistes(&db, &regle("added_at", "in_last", json!(30))),
+            vec![5]
+        );
+        assert!(pistes(&db, &regle("added_at", "in_last", json!(3))).is_empty());
+        assert_eq!(
+            pistes(&db, &regle("last_played_at", "in_last", json!(7))),
+            vec![3]
+        );
+        assert_eq!(
+            pistes(&db, &regle("last_played_at", "in_last", json!("60"))),
+            vec![3, 4]
+        );
+    }
+
+    /// Un N illisible, nul ou négatif ne retient RIEN — jamais toute la
+    /// bibliothèque (#1231) — et la playlist le dit dans son rapport.
+    #[test]
+    fn un_nombre_de_jours_illisible_ne_retient_rien() {
+        let db = avec_dates_recentes();
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for champ in ["added_at", "last_played_at"] {
+            for v in [json!(0), json!(-3), json!("abc"), Value::Null] {
+                let r = regle(champ, "in_last", v.clone());
+                assert!(albums(&db, &r).is_empty(), "{champ} {v}");
+                let (w, _o, _l) = build_album_query(&r, "all", "title", "asc", None, &ctx);
+                assert!(w.contains(crate::regles_sql::FAUX), "{champ} {v} : {w}");
+                let (w, _o, _l, refusees) =
+                    build_smart_query_rapport(&r, "all", "title", "asc", None, &ctx);
+                assert!(w.contains(crate::regles_sql::FAUX), "{champ} {v} : {w}");
+                assert!(!refusees.is_empty(), "{champ} {v} : refus non signalé");
+            }
+        }
+    }
 }
 
 /// 🔴 Les règles DÉJÀ ENREGISTRÉES rendent exactement la même requête qu'avant
@@ -635,6 +960,10 @@ pub(crate) mod tests {
 /// playlists du .18 et les formes que l'ancien éditeur écrivait (`equals`,
 /// `gte`, `operator`, `is_empty`, `branch_of`…). Chaque colonne — clause,
 /// tri, borne, refusées — doit ressortir au caractère près.
+///
+/// Seule retouche voulue depuis : la clause « Favori · est · Piste » (#5997,
+/// forum #2127) départage désormais les éditions par l'album et l'ISRC — la
+/// ligne gelée correspondante a été mise à jour avec elle.
 #[cfg(test)]
 mod anciennes_regles {
     use crate::smart_playlists::build_smart_query_rapport;

@@ -342,11 +342,7 @@ fn calculer_les_comptes(
     let (where_clause, _order, _limit) =
         build_album_query(rules_str, match_mode, sort_by, sort_order, None, ctx);
 
-    let album_count_sql = format!(
-        "SELECT COUNT(DISTINCT al.id) FROM albums al \
-         LEFT JOIN artists ar ON al.artist_id = ar.id \
-         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-    );
+    let album_count_sql = sql_compte_de_collection("al.id", &where_clause);
     let (albums_en_base, albums_de_service) = compte_albums_ventile(
         &*state.backend,
         &album_count_sql,
@@ -369,11 +365,7 @@ fn calculer_les_comptes(
     // disparaît, le nombre d'albums reste.
     let compte_complet = albums_de_service == 0;
     let track_count = if compte_complet {
-        let track_count_sql = format!(
-            "SELECT COUNT(DISTINCT t.id) FROM albums al \
-             LEFT JOIN artists ar ON al.artist_id = ar.id \
-             LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
-        );
+        let track_count_sql = sql_compte_de_collection("t.id", &where_clause);
         state
             .backend
             .query_many(&track_count_sql, &[])
@@ -782,32 +774,33 @@ pub fn build_album_query(
 
         // --- added_at / last_played_at use timestamp logic ---
         if field == "added_at" {
-            let ts = resolve_timestamp_sql(&value);
+            // #6143 — la borne est calculée en Rust, en secondes, et comparée
+            // telle quelle à `file_mtime` : plus de `DATETIME(…, 'unixepoch')`
+            // ni de `DATETIME('now', …)`, propres à SQLite (PostgreSQL les
+            // refuse et l'aperçu tombait). Une date illisible ne retient rien.
+            //
             // NB: "greater_than"/"less_than" normalize to ">="/"<=" above, so
             // both spellings must be matched here — the seeded "🆕 Récents"
             // (added_at greater_than 90d) used to fall through `_ => continue`,
             // dropping its only rule and matching the ENTIRE library.
             let cond = match op {
-                ">" | ">=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
-                "<" | "<=" => format!(
-                    "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                     WHERE DATETIME(t2.file_mtime, 'unixepoch') {op} {ts})"
-                ),
+                ">" | ">=" | "<" | "<=" => match crate::regles_sql::horodatage_epoch(&value) {
+                    Some(ts) => format!(
+                        "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                         WHERE t2.file_mtime {op} {ts})"
+                    ),
+                    None => crate::regles_sql::FAUX.to_string(),
+                },
                 "between" => {
-                    if let Some(arr) = value_raw.and_then(|v| v.as_array()) {
-                        let lo = arr.first().and_then(|v| v.as_str()).unwrap_or("2000-01-01");
-                        let hi = arr.get(1).and_then(|v| v.as_str()).unwrap_or("2099-01-01");
-                        let lo_sql = resolve_timestamp_sql(lo);
-                        let hi_sql = resolve_timestamp_sql(hi);
-                        format!(
-                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
-                             WHERE DATETIME(t2.file_mtime, 'unixepoch') BETWEEN {lo_sql} AND {hi_sql})"
-                        )
-                    } else {
+                    if value_raw.and_then(|v| v.as_array()).is_none() {
                         continue;
+                    }
+                    match crate::regles_sql::bornes_epoch(value_raw) {
+                        Some((lo, hi)) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime BETWEEN {lo} AND {hi})"
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
                     }
                 }
                 // #5547 — « jamais » : l'éditeur le propose pour toute date,
@@ -817,6 +810,20 @@ pub fn build_album_query(
                 "is_null" => "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
                      WHERE t2.file_mtime IS NULL)"
                     .to_string(),
+                // #6122 (forum 2217) — « dans les N derniers jours » : le
+                // seuil se lit à l'horloge ICI, à chaque requête. Comparé en
+                // secondes à `file_mtime`, sans `DATETIME` (propre à SQLite).
+                // Un N illisible ne retient rien, jamais tout.
+                crate::regles_sql::DANS_LES_DERNIERS_JOURS => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT DISTINCT t2.album_id FROM tracks t2 \
+                             WHERE t2.file_mtime >= {})",
+                            s.epoch
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
+                }
                 _ => continue,
             };
             conditions.push(cond);
@@ -900,6 +907,19 @@ pub fn build_album_query(
                          GROUP BY t3.album_id HAVING MAX(lh.listened_at) BETWEEN {lo} AND {hi})"
                     )
                 }
+                // #6122 — « écouté dans les N derniers jours » : une écoute au
+                // moins depuis le seuil, lu à l'horloge à chaque requête.
+                ("last_played_at", crate::regles_sql::DANS_LES_DERNIERS_JOURS) => {
+                    match crate::regles_sql::seuil_de(value_raw) {
+                        Some(s) => format!(
+                            "al.id IN (SELECT t3.album_id FROM tracks t3 \
+                             JOIN listen_history lh ON lh.track_id = t3.id \
+                             WHERE lh.listened_at >= {} GROUP BY t3.album_id)",
+                            s.iso
+                        ),
+                        None => crate::regles_sql::FAUX.to_string(),
+                    }
+                }
                 ("last_played_at", "is_null") => {
                     "al.id NOT IN (SELECT DISTINCT t3.album_id FROM tracks t3 \
                      JOIN listen_history lh ON lh.track_id = t3.id)"
@@ -935,6 +955,11 @@ pub fn build_album_query(
         let col = match field {
             "genre" => "t.genre",
             "artist" | "artist_name" => "ar.name",
+            // #6121 (forum 2218) — « Artiste de l'album » : la balise
+            // ALBUMARTIST d'une piste de l'album, à défaut l'artiste de
+            // l'album (`ar`, joint sur `al.artist_id`). Même lecture que
+            // `regles_sql::colonne_piste`.
+            "album_artist" => "COALESCE(NULLIF(t.album_artist, ''), ar.name)",
             "album" | "album_title" | "title" => "al.title",
             "composer" => "t.composer",
             "label" => "al.label",
@@ -957,6 +982,15 @@ pub fn build_album_query(
             "track_number" => "CAST(t.track_number AS INTEGER)",
             "disc_number" => "CAST(t.disc_number AS INTEGER)",
             "bpm" => "CAST(t.bpm AS INTEGER)",
+            // #6123 — la note d'une piste de l'album (balises, 0 à 5) : un
+            // album passe dès qu'UNE de ses pistes passe. `rating` reste la
+            // note de l'ALBUM, traitée plus haut.
+            "track_rating" => "t.rating",
+            // #6124 — l'année ORIGINALE est une donnée d'album ; la VERSION,
+            // une balise de piste rangée dans `track_metadata` : l'album
+            // passe si l'une de ses pistes la porte.
+            "original_year" => "CAST(al.original_year AS INTEGER)",
+            "version" => crate::regles_sql::SQL_VERSION_DE_LA_PISTE,
             _ => continue,
         };
 
@@ -965,6 +999,7 @@ pub fn build_album_query(
             "genre"
                 | "artist"
                 | "artist_name"
+                | "album_artist"
                 | "album"
                 | "album_title"
                 | "title"
@@ -974,6 +1009,7 @@ pub fn build_album_query(
                 | "source"
                 | "folder"
                 | "file_path"
+                | "version"
         );
         let int_val = || value.parse::<i64>().unwrap_or(0);
 
@@ -1073,14 +1109,26 @@ pub fn build_album_query(
     (where_clause, order, limit_clause)
 }
 
-/// Execute a smart album query and return album rows as JSON values.
-fn execute_album_query(
-    state: &SmartHttpState,
+/// Le compte `COUNT(DISTINCT {objet})` d'une collection — `al.id` pour ses
+/// albums, `t.id` pour ses pistes — sur la même jointure que
+/// [`sql_albums_de_collection`]. Une seule écriture, pour que l'épreuve du plan
+/// (#2149) lise le SQL que la liste des collections joue.
+pub(crate) fn sql_compte_de_collection(objet: &str, where_clause: &str) -> String {
+    format!(
+        "SELECT COUNT(DISTINCT {objet}) FROM albums al \
+         LEFT JOIN artists ar ON al.artist_id = ar.id \
+         LEFT JOIN tracks t ON t.album_id = al.id {where_clause}"
+    )
+}
+
+/// La liste des albums d'une collection, telle que [`execute_album_query`] la
+/// joue.
+pub(crate) fn sql_albums_de_collection(
     where_clause: &str,
     order: &str,
     limit_clause: &str,
-) -> Result<Vec<Value>, AppError> {
-    let sql = format!(
+) -> String {
+    format!(
         // `al.is_compilation` (#1957) est dans le GROUP BY comme les autres
         // colonnes d'album : PostgreSQL refuse une colonne ni groupée ni
         // agrégée, SQLite l'accepterait. Écrire pour les deux.
@@ -1093,7 +1141,17 @@ fn execute_album_query(
          GROUP BY al.id, al.title, ar.name, al.year, al.cover_path, al.genre, al.is_compilation \
          {} {}",
         where_clause, order, limit_clause
-    );
+    )
+}
+
+/// Execute a smart album query and return album rows as JSON values.
+fn execute_album_query(
+    state: &SmartHttpState,
+    where_clause: &str,
+    order: &str,
+    limit_clause: &str,
+) -> Result<Vec<Value>, AppError> {
+    let sql = sql_albums_de_collection(where_clause, order, limit_clause);
     tracing::debug!(sql = %sql, "smart_collection_album_query");
 
     let rows = state
@@ -1580,14 +1638,50 @@ mod tests {
     #[test]
     fn resolve_timestamp_relative_forms() {
         // "now-Nd" (editor form) and bare "Nd" (seeded "🆕 Récents") are both
-        // N-days-ago; anything else stays a quoted literal.
-        assert_eq!(
-            resolve_timestamp_sql("now-30d"),
-            "DATETIME('now', '-30 days')"
-        );
-        assert_eq!(resolve_timestamp_sql("90d"), "DATETIME('now', '-90 days')");
-        assert_eq!(resolve_timestamp_sql("90"), "DATETIME('now', '-90 days')");
+        // N-days-ago — désormais un littéral ISO calculé en Rust (#6143) ;
+        // anything else stays a quoted literal.
+        let attendu = |jours: i64| {
+            let d = chrono::Utc::now() - chrono::Duration::days(jours);
+            format!("'{}'", d.format("%Y-%m-%d"))
+        };
+        for (forme, jours) in [("now-30d", 30), ("90d", 90), ("90", 90)] {
+            let sql = resolve_timestamp_sql(forme);
+            assert!(
+                sql.starts_with(&attendu(jours)[..11]) && sql.ends_with("Z'"),
+                "{forme} → {sql}"
+            );
+            assert!(!sql.contains("DATETIME"), "{forme} → {sql}");
+        }
         assert_eq!(resolve_timestamp_sql("2024-01-01"), "'2024-01-01'");
+    }
+
+    /// #6143 — aucune règle de date ne compile en `DATETIME(…)`, fonction
+    /// propre à SQLite que PostgreSQL refuse.
+    #[test]
+    fn regles_de_date_sans_datetime_6143() {
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for champ in ["added_at", "last_played_at"] {
+            for (op, valeur) in [
+                ("greater_than", r#""2024-01-01""#),
+                ("less_than", r#""2024-01-01""#),
+                (">", r#""now-90d""#),
+                ("<", r#""90d""#),
+                ("between", r#"["2018-01-01","now-30d"]"#),
+            ] {
+                let rules =
+                    format!(r#"[{{"field":"{champ}","operator":"{op}","value":{valeur}}}]"#);
+                let (where_clause, _, _) =
+                    build_album_query(&rules, "all", "title", "asc", None, &ctx);
+                assert!(
+                    !where_clause.to_uppercase().contains("DATETIME"),
+                    "{champ} {op} {valeur} compile encore en DATETIME (#6143) : {where_clause}"
+                );
+                assert!(
+                    !where_clause.is_empty(),
+                    "{champ} {op} {valeur} : règle perdue"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1599,7 +1693,7 @@ mod tests {
         let rules = r#"[{"field":"added_at","operator":"greater_than","value":"90d"}]"#;
         let (where_clause, _, _) = build_album_query(rules, "all", "title", "asc", None, &ctx);
         assert!(
-            where_clause.contains("DATETIME('now', '-90 days')"),
+            where_clause.contains("t2.file_mtime >= "),
             "added_at rule must compile: {where_clause}"
         );
         assert!(where_clause.contains(">="));
@@ -2651,5 +2745,107 @@ mod apercu_note_5547 {
         // Le profil 2 n'a noté que Giant Steps.
         let v = apercu(r#"[{"field":"rating","op":">=","value":4}]"#, 2).await;
         assert_eq!(v["total"], 1, "{v}");
+    }
+}
+
+/// #2149 (Sevy Tabroc, 1.0.0-rc3, 109 152 pistes) — les collections à règle
+/// de GENRE mettent plus d'une minute à s'ouvrir ; les autres s'ouvrent tout
+/// de suite. Le genre est une colonne de piste : sans index qui le porte, la
+/// jointure `tracks` relit chaque ligne de piste dans la table. L'épreuve lit
+/// le plan des TROIS requêtes que joue une collection (liste d'albums, compte
+/// d'albums, compte de pistes), écrites par les mêmes fonctions que la
+/// production, sur une base migrée et analysée.
+///
+/// Contre-épreuve : retirer `TRACKS_ALBUM_GENRE_INDEX` de la passe de
+/// démarrage de `run_migrations` fait tomber
+/// `une_regle_de_genre_ne_lit_que_des_index_2149`.
+#[cfg(test)]
+mod genre_couvrant_2149 {
+    use super::{build_album_query, sql_albums_de_collection, sql_compte_de_collection};
+    use crate::smart_refs::{DbRefResolver, RefCtx};
+    use std::sync::Arc;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::db::sqlite::SqliteDb;
+
+    fn base() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().expect("base");
+        db.init_schema().expect("schéma");
+        tune_core::db::migrations::run_migrations(&db).expect("migrations");
+        let genres = [
+            "Jazz",
+            "Pop-Rock",
+            "Classique",
+            "Électro",
+            "Chanson française",
+        ];
+        let mut sql = String::from("BEGIN;\n");
+        for a in 1..=40 {
+            sql.push_str(&format!(
+                "INSERT INTO artists (id, name) VALUES ({a}, 'Artiste {a}');\n"
+            ));
+        }
+        let mut tid = 0;
+        for al in 1..=400 {
+            sql.push_str(&format!(
+                "INSERT INTO albums (id, title, artist_id) VALUES ({al}, 'Album {al}', {});\n",
+                al % 40 + 1
+            ));
+            for n in 1..=9 {
+                tid += 1;
+                sql.push_str(&format!(
+                    "INSERT INTO tracks (id, title, album_id, artist_id, disc_number, \
+                     track_number, file_path, format, genre) VALUES ({tid}, 'Piste {n}', \
+                     {al}, {}, 1, {n}, '/m/{al}/{n}.flac', 'flac', '{}');\n",
+                    al % 40 + 1,
+                    genres[al as usize % genres.len()]
+                ));
+            }
+        }
+        sql.push_str("COMMIT;\nANALYZE;\n");
+        db.execute_batch(&sql).expect("remplissage");
+        Arc::new(db)
+    }
+
+    fn plan(db: &Arc<dyn DbBackend>, sql: &str) -> String {
+        db.query_many(&format!("EXPLAIN QUERY PLAN {sql}"), &[])
+            .expect("plan")
+            .iter()
+            .map(|r| r.last().and_then(|v| v.as_string()).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
+
+    #[test]
+    fn une_regle_de_genre_ne_lit_que_des_index_2149() {
+        let db = base();
+        let resolver = DbRefResolver::new(&db);
+        let ctx = RefCtx::root(&resolver, Some(1));
+        for regle in [
+            r#"[{"field":"genre","op":"=","value":"Jazz"}]"#,
+            r#"[{"field":"genre","op":"contains","value":"jazz"}]"#,
+        ] {
+            let (where_clause, order, limit) =
+                build_album_query(regle, "all", "title", "asc", None, &ctx);
+            for (quoi, sql) in [
+                (
+                    "liste",
+                    sql_albums_de_collection(&where_clause, &order, &limit),
+                ),
+                ("albums", sql_compte_de_collection("al.id", &where_clause)),
+                ("pistes", sql_compte_de_collection("t.id", &where_clause)),
+            ] {
+                let p = plan(&db, &sql);
+                assert!(
+                    p.contains("COVERING INDEX idx_tracks_album_genre"),
+                    "#2149 : {quoi} de la collection {regle} relit les pistes dans la \
+                     table au lieu de l'index (album, genre) : {p}"
+                );
+            }
+            let n = db
+                .query_many(&sql_compte_de_collection("al.id", &where_clause), &[])
+                .expect("compte")[0][0]
+                .as_i64();
+            assert_eq!(n, Some(80), "le compte ne change pas : {regle}");
+        }
     }
 }

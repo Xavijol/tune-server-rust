@@ -400,7 +400,10 @@ CREATE TABLE IF NOT EXISTS tracks (
     -- Pistes virtuelles CUE (#1763) : cf le commentaire de CORE_SCHEMA.
     cue_media_path TEXT,
     cue_start_ms BIGINT,
-    cue_end_ms BIGINT
+    cue_end_ms BIGINT,
+    -- Note de la piste (#6123). TEXT ici comme les autres colonnes numeriques :
+    -- la copie lie tout en texte ; la migration 088 la convertit en BIGINT.
+    rating TEXT
 );
 
 CREATE TABLE IF NOT EXISTS track_credits (
@@ -782,6 +785,11 @@ ALTER TABLE albums ADD COLUMN IF NOT EXISTS identification_tentee_le TEXT;
 -- Marquage IA d'un favori de service (#5530, PG 082 / SQLite 118). En ALTER
 -- pour la même raison qu'au-dessus.
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
+-- Miroir des favoris de service (#5997) : état, motif d'échec, ISRC. Sans
+-- numéro de migration, comme côté SQLite (`favoris_miroir_colonnes`).
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT;
+ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT;
 -- Référence d'album d'une piste de service (fil 2121, PG 078 / SQLite 114) :
 -- l'adresse de la page Bandcamp qui permet de resigner une URL de flux
 -- expirée. En ALTER pour la même raison que juste au-dessus : les trois tables
@@ -789,6 +797,9 @@ ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT;
 ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
+-- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
+-- 122). En ALTER pour la même raison que juste au-dessus.
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
 
 -- Etiquettes posees sur un objet de STREAMING (#3699). Une base creee par la
 -- bascule SQLite -> PostgreSQL enregistre `schema_version = 99` et ne rejoue
@@ -1238,6 +1249,9 @@ ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_fingerprint TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT;
 ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT;
 CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key);
+-- tracks: note de la piste lue dans ses balises (SQLite migration v124 / PG
+-- 088, #6123). TEXT pour la copie ; la 088, rejouee juste apres, la convertit.
+ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating TEXT;
 "#;
 
 /// Post-copy normalisation: `tracks.file_mtime` is canonically DOUBLE
