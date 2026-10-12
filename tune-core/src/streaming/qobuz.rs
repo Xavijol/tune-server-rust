@@ -1846,6 +1846,52 @@ impl QobuzService {
             .map(Into::into)
     }
 
+    /// Les playlists de `/playlist/getUserPlaylists`, avec leur propriétaire
+    /// et le drapeau `editable` (renesenses/tune-web-client#2097).
+    ///
+    /// Qobuz y mélange les playlists de l'utilisateur et celles qu'il SUIT
+    /// (éditoriales ou d'autres comptes). Chaque élément porte son
+    /// `owner.id`, et la réponse porte l'utilisateur en tête (`user.id`) :
+    /// une playlist est modifiable quand les deux concordent. Si l'un des deux
+    /// manque, on ne conclut rien (`None`) plutôt que d'inventer un refus.
+    ///
+    /// Fonction pure, pour être mise sous garde sans serveur simulé.
+    pub(crate) fn map_user_playlists(data: &serde_json::Value) -> Vec<StreamPlaylist> {
+        let id_de = |v: &serde_json::Value| -> Option<String> {
+            match v {
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                serde_json::Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+                _ => None,
+            }
+        };
+        let moi = id_de(&data["user"]["id"]);
+        data["playlists"]["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| {
+                        let proprietaire = id_de(&item["owner"]["id"]);
+                        let editable = match (&moi, &proprietaire) {
+                            (Some(moi), Some(p)) => Some(moi == p),
+                            _ => None,
+                        };
+                        StreamPlaylist {
+                            id: item["id"].as_u64().unwrap_or(0).to_string(),
+                            name: item["name"].as_str().unwrap_or("").into(),
+                            description: item["description"].as_str().map(Into::into),
+                            cover_path: Self::pochette_playlist(item),
+                            track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
+                            owner: item["owner"]["name"].as_str().map(Into::into),
+                            editable,
+                            covers: Self::pochettes_mosaique(item),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Map a Qobuz playlist item (editorial selection or search hit) to
     /// StreamPlaylist.
     fn map_featured_playlist(item: &serde_json::Value) -> StreamPlaylist {
@@ -1860,6 +1906,7 @@ impl QobuzService {
             cover_path: Self::pochette_playlist(item),
             track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: item["owner"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Self::pochettes_mosaique(item),
         }
     }
@@ -2511,6 +2558,7 @@ impl StreamingService for QobuzService {
             cover_path: Self::pochette_playlist(&data),
             track_count: data["tracks_count"].as_u64().unwrap_or(0) as u32,
             owner: data["owner"]["name"].as_str().map(Into::into),
+            editable: None,
             covers: Self::pochettes_mosaique(&data),
         })
     }
@@ -3076,24 +3124,7 @@ impl StreamingService for QobuzService {
         let data = self
             .detail_pagine("/playlist/getUserPlaylists", &[], "playlists")
             .await?;
-        let playlists = data["playlists"]["items"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| StreamPlaylist {
-                        id: item["id"].as_u64().unwrap_or(0).to_string(),
-                        name: item["name"].as_str().unwrap_or("").into(),
-                        description: item["description"].as_str().map(Into::into),
-                        cover_path: Self::pochette_playlist(item),
-                        track_count: item["tracks_count"].as_u64().unwrap_or(0) as u32,
-                        owner: None,
-                        covers: Self::pochettes_mosaique(item),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(playlists)
+        Ok(Self::map_user_playlists(&data))
     }
 
     async fn get_artist_albums(&self, artist_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -7272,5 +7303,56 @@ mod tests_favoris_en_vol {
             svc.favoris_en_vol.lock().unwrap().is_empty(),
             "aucun vol ne survit à sa requête"
         );
+    }
+}
+
+/// renesenses/tune-web-client#2097 — `/playlist/getUserPlaylists` mélange les
+/// playlists de l'utilisateur et celles qu'il suit ; seules les premières
+/// acceptent un ajout (Qobuz refuse les autres en 401).
+#[cfg(test)]
+mod tests_playlists_proprietaire_2097 {
+    use super::*;
+    use serde_json::json;
+
+    fn reponse() -> serde_json::Value {
+        json!({
+            "user": {"id": 1234, "login": "fabien"},
+            "playlists": {"offset": 0, "limit": 500, "total": 3, "items": [
+                {"id": 11, "name": "Ma playlist", "tracks_count": 3,
+                 "owner": {"id": 1234, "name": "fabien"}},
+                {"id": 22, "name": "Qobuz : Jazz Essentials", "tracks_count": 40,
+                 "owner": {"id": 2, "name": "Qobuz"}},
+                {"id": 33, "name": "Sans propriétaire", "tracks_count": 1}
+            ]}
+        })
+    }
+
+    #[test]
+    fn la_playlist_de_l_utilisateur_est_modifiable_celle_qu_il_suit_non() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        assert_eq!(pl.len(), 3);
+        assert_eq!(pl[0].editable, Some(true));
+        assert_eq!(pl[0].owner.as_deref(), Some("fabien"));
+        assert_eq!(pl[1].editable, Some(false));
+        assert_eq!(pl[1].owner.as_deref(), Some("Qobuz"));
+    }
+
+    #[test]
+    fn sans_proprietaire_ou_sans_utilisateur_on_ne_conclut_rien() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        assert_eq!(pl[2].editable, None);
+        let mut sans_user = reponse();
+        sans_user.as_object_mut().unwrap().remove("user");
+        let pl = QobuzService::map_user_playlists(&sans_user);
+        assert!(pl.iter().all(|p| p.editable.is_none()));
+    }
+
+    #[test]
+    fn le_drapeau_voyage_dans_le_json_et_disparait_quand_inconnu() {
+        let pl = QobuzService::map_user_playlists(&reponse());
+        let v = serde_json::to_value(&pl).unwrap();
+        assert_eq!(v[0]["editable"], json!(true));
+        assert_eq!(v[1]["editable"], json!(false));
+        assert!(v[2].get("editable").is_none());
     }
 }
