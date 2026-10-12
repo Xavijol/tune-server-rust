@@ -663,6 +663,13 @@ pub struct DlnaOutput {
     /// #5050 — instant de la dernière ligne `dlna_pause_701_position_lue` :
     /// borne son débit à une par `DIAG_701_INTERVALLE` et par renderer.
     dernier_diag_701: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #5050 (fil 2236) — la dernière `Pause` n'a pas pris : le renderer est
+    /// resté en `TRANSITIONING` au-delà de `PAUSE_701_BUDGET`, et Tune l'a
+    /// ARRÊTÉ à la place. La reprise ne peut pas être un `Play` « sur
+    /// place » : lu par `device_released_on_pause()`, l'orchestrateur rétablit
+    /// la piste à la position de la pause. Retombe au `play_media` et au
+    /// `stop` suivants.
+    arrete_au_lieu_de_pause: AtomicBool,
     /// La position rendue par le dernier `get_status` était-elle extrapolée ?
     /// Lu par `GET /api/devices/{id}/status` pour que l'estimation ne se fasse
     /// jamais passer pour une mesure.
@@ -819,6 +826,7 @@ impl DlnaOutput {
             volume_relu: AtomicBool::new(false),
             niveau_acquitte: Arc::default(),
             dernier_diag_701: std::sync::Mutex::new(None),
+            arrete_au_lieu_de_pause: AtomicBool::new(false),
             position_extrapolee: AtomicBool::new(false),
             duree_annoncee: tokio::sync::Mutex::new(None),
             pose_courante: std::sync::Mutex::new(None),
@@ -1685,6 +1693,17 @@ impl DlnaOutput {
                 pauses_renvoyees,
                 "dlna_pause_701_abandon"
             );
+            // #5050 (fil 2236, 12/10) — encore en TRANSITIONING, budget
+            // épuisé : le Beosound Stage de FabienM n'en sortait JAMAIS, sans
+            // un son, et refusait toutes les Pause suivantes. Rendre le refus
+            // laissait la zone ni pilotable ni arrêtable. `Stop` est permis
+            // depuis tout état du transport (UPnP AVTransport 2.4.4) : on s'y
+            // replie, et la reprise rétablira la piste à la position.
+            if conduite == ConduiteApresRefusPause::Attendre
+                && self.arreter_faute_de_pause(debut).await
+            {
+                return Ok(());
+            }
             let raison = acquitter_commande_soap("Pause", refus)
                 .err()
                 .unwrap_or_else(|| "Pause rejected".to_string());
@@ -1695,6 +1714,37 @@ impl DlnaOutput {
                 ),
                 None => raison,
             });
+        }
+    }
+
+    /// #5050 (fil 2236) — repli de `pause_apres_refus_701` : un `Stop` à la
+    /// place d'une `Pause` que le renderer n'accepte pas, figé en
+    /// `TRANSITIONING`. Vrai si le `Stop` est acquitté ; un refus ou un échec
+    /// de transport laisse remonter le refus de la `Pause`, comme avant.
+    ///
+    /// Les abonnements aux évènements restent en place (ce n'est pas un arrêt
+    /// demandé par l'auditeur, la piste reste celle de la zone).
+    async fn arreter_faute_de_pause(&self, debut: std::time::Instant) -> bool {
+        let attente_ms = debut.elapsed().as_millis() as u64;
+        match self.av_action("Stop", "<InstanceID>0</InstanceID>").await {
+            Ok(reponse) if !faute_commande_soap(&reponse) => {
+                self.arrete_au_lieu_de_pause.store(true, Ordering::SeqCst);
+                warn!(device = %self.name, attente_ms, "dlna_pause_701_repli_stop");
+                true
+            }
+            Ok(reponse) => {
+                warn!(
+                    device = %self.name,
+                    attente_ms,
+                    upnp_code = code_de_faute_upnp(&reponse).as_deref().unwrap_or("unknown"),
+                    "dlna_pause_701_repli_stop_refuse"
+                );
+                false
+            }
+            Err(error) => {
+                warn!(device = %self.name, attente_ms, %error, "dlna_pause_701_repli_stop_echec");
+                false
+            }
         }
     }
 
@@ -2370,7 +2420,14 @@ impl OutputTarget for DlnaOutput {
         crate::upnp_renderer::parse_upnp_time(&extract_tag(&reponse, "RelTime")?)
     }
 
+    /// #5050 (fil 2236) — la pause a été remplacée par un `Stop` (voir
+    /// `arreter_faute_de_pause`) : rien à reprendre « sur place ».
+    fn device_released_on_pause(&self) -> bool {
+        self.arrete_au_lieu_de_pause.load(Ordering::SeqCst)
+    }
+
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
+        self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         // #6059 — le départ que porte l'URL (flux natif relancé à la position).
         super::dlna_depart_natif::noter_url_posee(&self.device_id, media.url);
         // Les abonnements de la piste précédente d'abord : sans ce retrait,
@@ -3035,6 +3092,7 @@ impl OutputTarget for DlnaOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        self.arrete_au_lieu_de_pause.store(false, Ordering::SeqCst);
         self.unsubscribe_events().await;
         self.av_action("Stop", "<InstanceID>0</InstanceID>").await?;
         info!(device = %self.name, "dlna_stop");
