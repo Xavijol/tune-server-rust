@@ -77,6 +77,12 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // banc `pg_3715_*`) rendait « column ai_generated does not exist » à la
     // première lecture des favoris. Même raison que `first_seen_at`.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
+    // #5997 — miroir des favoris de service : état, motif d'échec et ISRC.
+    // Sans numéro de migration (voir `favoris_miroir_colonnes` côté SQLite) :
+    // posées ici, à chaque démarrage, et nommées par la lecture des favoris.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT",
     // Only re-attach the TEXT default while the column IS still text.
     // On a database healed by migration 012 the column is BIGINT and
     // already defaults to `nextval('streaming_favorites_id_seq')`, so
@@ -301,6 +307,12 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // base de bascule ne rejoue pas la 082, et l'écriture comme la lecture
     // des favoris de service nomment la colonne. NULL = inconnu.
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS ai_generated TEXT",
+    // #5997 — miroir des favoris de service : état, motif d'échec et ISRC.
+    // Sans numéro de migration (voir `favoris_miroir_colonnes` côté SQLite) :
+    // posées ici, à chaque démarrage, et nommées par la lecture des favoris.
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_etat TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS miroir_erreur TEXT",
+    "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS isrc TEXT",
     // #5402 — date de création d'un fichier (PG 084). Ici AUSSI : une base
     // de bascule ne rejoue pas la 084, et le scan comme le tri « par
     // création » nomment la colonne. DOUBLE PRECISION comme `first_seen_at`.
@@ -312,12 +324,20 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key TEXT",
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS audio_pcm_key_seen TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tracks_audio_pcm_key ON tracks(audio_pcm_key)",
+    // #6123 — la note de la piste lue dans ses balises (PG 088). Ici AUSSI :
+    // l'INSERT et l'UPDATE des pistes la NOMMENT. Sans effet sur une colonne
+    // déjà là, TEXT de bascule comprise : c'est la 088 qui la convertit.
+    "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating BIGINT",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS album_ref TEXT",
     "ALTER TABLE streaming_favorites ADD COLUMN IF NOT EXISTS album_ref TEXT",
     "ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT",
+    // #6079 — l'artiste d'une piste de service chez son service (PG 087). Ici
+    // AUSSI, même raison : une base de bascule ne rejouera jamais la 087, alors
+    // que l'écriture de la file nomme la colonne.
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT",
     // Section « Live » — types secondaires MusicBrainz du disque (PG 081).
     // Ici AUSSI : une base de bascule ne rejouera jamais la 081, alors que la
     // fiche artiste nomme la colonne. NULL = inconnu.

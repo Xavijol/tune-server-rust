@@ -133,7 +133,10 @@ impl StreamInfo {
         if let Some(taille) = self.file_size.filter(|_| self.format == "wav") {
             return Some(taille);
         }
-        let dur = self.duration_ms?;
+        // Forum #2189 — une durée NULLE est une durée inconnue (base qui n'a
+        // pas su la lire), jamais une piste vide : sans ce filtre, le renderer
+        // recevait `Content-Length: 44`, l'en-tête seul, et restait à 0:00.
+        let dur = self.duration_ms.filter(|d| *d > 0)?;
         if self.sample_rate == 0 || self.channels == 0 || self.bit_depth == 0 {
             return None;
         }
@@ -213,6 +216,28 @@ impl StreamInfo {
 /// #5716 — ce que l'on fait du codec reconnu par la sonde d'une radio.
 pub type ObservateurDeCodec = Box<dyn FnOnce(&'static str) + Send>;
 
+/// #6130 — ce qui a FABRIQUÉ un flux de conversion, posé par l'orchestrateur
+/// au moment où il ouvre la session, et relu par le journal de chaque
+/// connexion HTTP (`conversion_connexion_contexte`, `bruit_suspect`).
+///
+/// Diagnostic seulement : rien ne le lit pour décider du rendu. Le bruit
+/// blanc de la zone 10 du .18 (11/10) ne se reproduit pas à la demande ; sans
+/// ces faits au journal, la prochaine occurrence ne dirait ni d'où venait le
+/// PCM, ni quels étages l'avaient traité, ni ce que la zone jouait avant.
+#[derive(Debug, Clone, Default)]
+pub struct ContexteDeConversion {
+    pub zone_id: i64,
+    /// La source : service ou bibliothèque, codec, format annoncé, et ce que
+    /// le décodeur rend (fréquence / profondeur).
+    pub source: String,
+    /// La chaîne d'étages DSP et de greffons, dans l'ordre d'exécution, avec
+    /// la fréquence d'entrée et de sortie de chacun.
+    pub chaine: String,
+    /// Ce que la zone jouait juste avant (radio ou piste, fréquence), et si sa
+    /// session était encore ouverte.
+    pub precedente: String,
+}
+
 pub struct StreamSession {
     pub id: String,
     pub info: StreamInfo,
@@ -263,6 +288,12 @@ pub struct StreamSession {
     /// PCM nu, sans RIFF. Le consommateur qui voit passer l'en-tête le range
     /// ici ; chaque nouvelle connexion partant de l'octet 0 le reçoit d'abord.
     pub wav_header_stash: std::sync::OnceLock<Vec<u8>>,
+    /// #6130 — voir [`ContexteDeConversion`]. Posé une fois, par
+    /// l'orchestrateur ; vide sur les sessions qui n'en ont pas.
+    pub contexte_de_conversion: std::sync::OnceLock<ContexteDeConversion>,
+    /// #6130 — un `bruit_suspect` a déjà été signalé sur ce flux : un WARN au
+    /// plus par flux, quel que soit le nombre de connexions.
+    pub bruit_suspect_signale: std::sync::atomic::AtomicBool,
     /// Position, DANS LE FLUX, du prochain octet que le canal rendra.
     ///
     /// Un canal de conversion est un TUYAU : il ne connaît qu'un sens et ne
@@ -579,6 +610,8 @@ impl StreamSession {
             detected_bit_depth: std::sync::atomic::AtomicU16::new(0),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
+            contexte_de_conversion: std::sync::OnceLock::new(),
+            bruit_suspect_signale: std::sync::atomic::AtomicBool::new(false),
             octets_du_canal: std::sync::atomic::AtomicU64::new(0),
             retenue: std::sync::Mutex::new(RetenueDuCanal::default()),
             created_at: Instant::now(),
@@ -1803,6 +1836,19 @@ impl AudioStreamer {
         Some(info.seek_ms.unwrap_or(0) + octets.saturating_mul(1_000) / nominal)
     }
 
+    /// #6066 — débit nominal de la session, en octets par seconde, tel que
+    /// le flux le SERT (voir [`StreamInfo::debit_nominal_octets_par_seconde`]).
+    /// `None` : session inconnue ou débit incalculable. Contrairement à
+    /// [`Self::stream_audio_servi_ms`], la radio n'est pas exclue : la
+    /// question est « combien d'audio ces octets portent-ils », pas « où en
+    /// est la lecture ».
+    pub async fn stream_debit_nominal(&self, stream_id: &str) -> Option<u64> {
+        let session = { self.sessions.lock().await.get(stream_id).cloned() }?;
+        session
+            .effective_output_info()
+            .debit_nominal_octets_par_seconde()
+    }
+
     /// Reprendre les sessions mortes — sur leur SILENCE, pas sur leur âge.
     ///
     /// Une session qui débite des octets est vivante quel que soit son âge.
@@ -2627,6 +2673,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(info.wav_content_length(), None);
+    }
+
+    /// Forum #2189 (DMP-A6, 1.0.0-rc3) : une piste dont la base ignore la
+    /// durée (`duration_ms = 0`, DSD128 converti en WAV 176,4/24) annonçait
+    /// `Content-Length: 44` — l'en-tête seul, zéro octet d'audio. Le renderer
+    /// lisait l'en-tête, refermait, réessayait, puis restait à 0:00, la piste
+    /// affichée. Une durée nulle est une durée INCONNUE, pas une piste vide.
+    #[test]
+    fn une_duree_nulle_n_annonce_pas_un_wav_vide_2189() {
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: 176_400,
+            bit_depth: 24,
+            channels: 2,
+            file_size: None,
+            duration_ms: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            info.wav_content_length(),
+            None,
+            "durée 0 : la longueur doit rester inconnue (flux chunké), jamais 44 octets"
+        );
     }
 
     #[test]

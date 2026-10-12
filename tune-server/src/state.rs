@@ -200,6 +200,9 @@ pub struct AppState {
     /// « restart server to activate » — donc un emplacement ecrit une fois
     /// suffit, comme `plugin_names` plus haut.
     pub relay_client: Arc<OnceLock<Arc<tune_core::cloud::relay::RelayClient>>>,
+    /// #4626 — côté agent : le code d'appairage en cours et les sorties
+    /// tenues par un maître. En mémoire seulement.
+    pub agent_tune: Arc<crate::agent_tune::EtatAgentTune>,
 }
 
 impl axum::extract::FromRef<AppState> for tune_streaming_http::StreamingHttpState {
@@ -501,6 +504,30 @@ impl AppState {
         // #5065 — `sources.changed` part sur le même bus.
         orch.sources_physiques().brancher_bus(event_bus.clone());
         orch.license = Some(license.clone());
+        // #6018 — la lecture d'un titre Spotify : le PCM du récepteur
+        // librespot entre par la porte des sources PCM, comme un CD.
+        let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
+        orch.sources_pcm().inscrire(
+            tune_core::streaming::spotify_lecture::SOURCE,
+            Arc::new(
+                tune_core::streaming::spotify_lecture::FournisseurSpotify::new(
+                    spotify_connect.clone(),
+                    Arc::new(
+                        tune_core::streaming::spotify_lecture::PiloteDuRegistre::new(
+                            services.clone(),
+                        ),
+                    ),
+                    // Option expérimentale, désactivée par défaut : relue à
+                    // chaque ouverture de titre.
+                    {
+                        let db = backend.clone();
+                        Arc::new(move || {
+                            tune_core::streaming::spotify_lecture::lecture_activee(&db)
+                        })
+                    },
+                ),
+            ),
+        );
         let orchestrator = Arc::new(orch);
 
         let (ssdp_tx, _) = tokio::sync::mpsc::channel(64);
@@ -516,8 +543,6 @@ impl AppState {
 
         let suggestion_store = Arc::new(SuggestionStore::with_backend(backend.clone()));
         suggestion_store.setup_table().ok();
-
-        let spotify_connect = Arc::new(SpotifyConnectManager::new("Tune".into(), port));
 
         let http_client = tune_core::http::client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -593,6 +618,7 @@ impl AppState {
             wasm_plugins: Arc::new(OnceLock::new()),
             #[cfg(feature = "cloud-relay")]
             relay_client: Arc::new(OnceLock::new()),
+            agent_tune: Arc::new(crate::agent_tune::EtatAgentTune::default()),
         })
     }
 

@@ -1,6 +1,6 @@
 {
   "genere_depuis": {
-    "web_sha": "6309565045b7e3d9aeab8234f7115ae7634f4434",
+    "web_sha": "c054c741876f6e9cb849925a8c68ef1017f04270",
     "regenerer": "scripts/web-contract-map.py --web <tune-web-client> --web-sha <sha> -o docs/contrat-web.json",
     "gardee_par": [
       "tune-server/tests/web_response_contracts.rs (la_carte_web_ne_cite_que_des_routes_encore_servies)",
@@ -1118,6 +1118,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -1339,6 +1340,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -1346,6 +1348,20 @@
         "last_played_at",
         "banned"
       ]
+    },
+    {
+      "route": "/library/artwork/artists-without-image",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "artists",
+        "total",
+        "artists_without_image",
+        "limit",
+        "offset"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/library/artwork/enrich",
@@ -1966,6 +1982,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -2366,31 +2383,6 @@
       "champs_optionnels": []
     },
     {
-      "route": "/playlist-manager/backups/{}",
-      "methode": "DELETE",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "deleted",
-        "id"
-      ],
-      "champs_optionnels": []
-    },
-    {
-      "route": "/playlist-manager/backups/{}/restore",
-      "methode": "POST",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [
-        "local_playlist_id",
-        "name",
-        "tracks_restored",
-        "tracks_matched",
-        "tracks_not_found"
-      ],
-      "champs_optionnels": []
-    },
-    {
       "route": "/playlist-manager/playlists/{}/{}",
       "methode": "DELETE",
       "type": "(en ligne)",
@@ -2568,6 +2560,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -2821,7 +2814,9 @@
         "cover_url",
         "created_at",
         "first_seen_at",
-        "ai_generated"
+        "ai_generated",
+        "miroir_etat",
+        "miroir_erreur"
       ]
     },
     {
@@ -3049,7 +3044,8 @@
       ],
       "champs_optionnels": [
         "reason",
-        "error"
+        "error",
+        "lecture_experimentale"
       ]
     },
     {
@@ -3066,7 +3062,26 @@
       ],
       "champs_optionnels": [
         "reason",
-        "error"
+        "error",
+        "lecture_experimentale"
+      ]
+    },
+    {
+      "route": "/spotify-connect/lecture-experimentale",
+      "methode": "POST",
+      "type": "SpotifyConnectStatus",
+      "liste": false,
+      "champs_obligatoires": [
+        "enabled",
+        "device_name",
+        "zone_id",
+        "binary_available",
+        "active"
+      ],
+      "champs_optionnels": [
+        "reason",
+        "error",
+        "lecture_experimentale"
       ]
     },
     {
@@ -3083,7 +3098,8 @@
       ],
       "champs_optionnels": [
         "reason",
-        "error"
+        "error",
+        "lecture_experimentale"
       ]
     },
     {
@@ -3226,9 +3242,30 @@
       "champs_optionnels": []
     },
     {
-      "route": "/streaming/youtube/moods",
+      "route": "/streaming/youtube/charts",
       "methode": "GET",
       "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "country",
+        "sections"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/home",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "sections"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/streaming/youtube/moods",
+      "methode": "GET",
+      "type": "YtCategorieAmbiances",
       "liste": true,
       "champs_obligatoires": [
         "title",
@@ -3240,12 +3277,9 @@
       "route": "/streaming/youtube/moods/{}",
       "methode": "GET",
       "type": "(en ligne)",
-      "liste": true,
+      "liste": false,
       "champs_obligatoires": [
-        "title",
-        "playlistId",
-        "description",
-        "cover_path"
+        "sections"
       ],
       "champs_optionnels": []
     },
@@ -3331,6 +3365,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -3442,6 +3477,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -3517,6 +3553,24 @@
     },
     {
       "route": "/streaming/{}/featured",
+      "methode": "GET",
+      "type": "StreamingPlaylist",
+      "liste": true,
+      "champs_obligatoires": [
+        "source_id",
+        "name",
+        "track_count",
+        "duration_ms",
+        "source"
+      ],
+      "champs_optionnels": [
+        "description",
+        "cover_path",
+        "covers"
+      ]
+    },
+    {
+      "route": "/streaming/{}/featured-playlists",
       "methode": "GET",
       "type": "StreamingPlaylist",
       "liste": true,
@@ -3772,6 +3826,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -3820,7 +3875,8 @@
       "champs_optionnels": [
         "username",
         "subscription",
-        "favoris_ecrivables"
+        "favoris_ecrivables",
+        "favoris_miroir"
       ]
     },
     {
@@ -3865,6 +3921,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -3915,6 +3972,7 @@
         "composer",
         "isrc",
         "bpm",
+        "rating",
         "comments",
         "musicbrainz_recording_id",
         "dynamic_range",
@@ -4483,6 +4541,36 @@
         "library_without_file",
         "library_out_of_scope",
         "library_failed"
+      ]
+    },
+    {
+      "route": "/system/replaygain/reanalyze",
+      "methode": "GET",
+      "type": "RemesureReplayGain",
+      "liste": false,
+      "champs_obligatoires": [
+        "stale",
+        "running"
+      ],
+      "champs_optionnels": [
+        "algo",
+        "enabled",
+        "status"
+      ]
+    },
+    {
+      "route": "/system/replaygain/reanalyze",
+      "methode": "POST",
+      "type": "RemesureReplayGain",
+      "liste": false,
+      "champs_obligatoires": [
+        "stale",
+        "running"
+      ],
+      "champs_optionnels": [
+        "algo",
+        "enabled",
+        "status"
       ]
     },
     {
@@ -5187,6 +5275,48 @@
         "applied_live",
         "portee"
       ]
+    },
+    {
+      "route": "/zones/{}/compatibilite-renderer",
+      "methode": "DELETE",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [
+        "zone_id",
+        "profils_oublies"
+      ],
+      "champs_optionnels": []
+    },
+    {
+      "route": "/zones/{}/crossfade",
+      "methode": "GET",
+      "type": "CrossfadeSetting",
+      "liste": false,
+      "champs_obligatoires": [
+        "zone_id",
+        "available",
+        "enabled",
+        "duration"
+      ],
+      "champs_optionnels": [
+        "output_type",
+        "exclusive",
+        "max_duration"
+      ]
+    },
+    {
+      "route": "/zones/{}/crossfade",
+      "methode": "POST",
+      "type": "CrossfadeUpdate",
+      "liste": false,
+      "champs_obligatoires": [
+        "zone_id",
+        "available",
+        "crossfade_enabled",
+        "crossfade_duration",
+        "applies_on_this_output"
+      ],
+      "champs_optionnels": []
     },
     {
       "route": "/zones/{}/device-presets",
@@ -6173,7 +6303,7 @@
     },
     {
       "route": "/profiles/{}/favorites/streaming/add",
-      "type": "any",
+      "type": "ReponseEcritureFavoriService | undefined",
       "raison": "type non structurel"
     },
     {
@@ -6187,11 +6317,6 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/streaming/youtube/charts",
-      "type": "Record<string, any[]>",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/playlist-manager/services",
       "type": "Record<string, { authenticated: boolean; supports_write: boolean; supports_delete?: boolean }>",
       "raison": "type non structurel"
@@ -6202,42 +6327,7 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/playlist-manager/batch-transfer",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
       "route": "/playlist-manager/merge",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/playlist-manager/backup",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/playlist-manager/backups/{}",
-      "type": "SnapshotDetail",
-      "raison": "type introuvable dans les sources"
-    },
-    {
-      "route": "/playlist-manager/links",
-      "type": "any[]",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/playlist-manager/links",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/playlist-manager/links/{}/sync",
-      "type": "any",
-      "raison": "type non structurel"
-    },
-    {
-      "route": "/playlist-manager/links/{}",
       "type": "any",
       "raison": "type non structurel"
     },
@@ -6572,6 +6662,11 @@
       "raison": "type non structurel"
     },
     {
+      "route": "/system/config-backup/cloud/{}",
+      "type": "any",
+      "raison": "type non structurel"
+    },
+    {
       "route": "/library/identify-all",
       "type": "Record<string, unknown>",
       "raison": "type non structurel"
@@ -6648,7 +6743,7 @@
     }
   ],
   "resume": {
-    "routes_cartographiees": 327,
-    "appels_non_resolus": 161
+    "routes_cartographiees": 335,
+    "appels_non_resolus": 154
   }
 }

@@ -333,6 +333,12 @@ pub struct Track {
     pub composer: Option<String>,
     pub year: Option<i32>,
     pub bpm: Option<f64>,
+    /// La note de la piste lue dans ses balises, de 0 à 5 (#6123) —
+    /// `tracks.rating`. `None` : le fichier n'en porte pas. Sans profil : c'est
+    /// la note du FICHIER ; la note par profil reste celle de l'album
+    /// (`album_ratings`). Échelle : `metadata::note`.
+    #[serde(default)]
+    pub rating: Option<i32>,
     pub label: Option<String>,
     pub musicbrainz_recording_id: Option<String>,
     pub cover_path: Option<String>,
@@ -383,7 +389,13 @@ impl Track {
     pub fn to_json(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).unwrap_or_default();
         if let Some(obj) = v.as_object_mut() {
-            let badge = crate::audio::channels::channel_badge(self.channels as u16);
+            // La disposition DÉCLARÉE par le fichier fait foi (un FLAC 4.0
+            // n'est pas un « 5.1 ») ; une piste CUE la lit dans son image.
+            let chemin = self.file_path.as_deref().or(self.cue_media_path.as_deref());
+            let badge = crate::audio::channels::channel_badge_declare(
+                chemin.map(std::path::Path::new),
+                self.channels.clamp(0, i32::from(u16::MAX)) as u16,
+            );
             obj.insert("channel_badge".into(), serde_json::json!(badge));
         }
         v
@@ -418,6 +430,7 @@ impl Track {
             composer: None,
             year: None,
             bpm: None,
+            rating: None,
             label: None,
             musicbrainz_recording_id: None,
             cover_path: None,
@@ -658,6 +671,7 @@ mod tests {
             cue_media_path: None,
             cue_start_ms: None,
             cue_end_ms: None,
+            rating: None,
         };
         let json = serde_json::to_value(&track).unwrap();
         assert_eq!(json["title"], "So What");
