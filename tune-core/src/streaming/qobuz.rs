@@ -1529,7 +1529,18 @@ impl QobuzService {
         use crate::metadata::release_type::{
             PistesDuDisque, depuis_service, type_d_album_de_service,
         };
-        let annonce = item["release_type"].as_str().and_then(depuis_service);
+        // Le champ que Qobuz rend pour SON classement (relevé le 12/10/2026 sur
+        // « Riverside EP » : `release_type: "single"`, `product_type:
+        // "single"`, dans `album/get` seulement). `epmini` est le mot de
+        // Qobuz pour un EP court ; `product_type` sert quand `release_type`
+        // manque.
+        let annonce = ["release_type", "product_type"].iter().find_map(|cle| {
+            let brut = item[*cle].as_str()?;
+            if brut.eq_ignore_ascii_case("epmini") {
+                return Some(crate::metadata::release_type::TypeDeSortie::Ep);
+            }
+            depuis_service(brut)
+        });
         let nombre = item["tracks_count"].as_u64().unwrap_or(0);
         let duree_ms = item["duration"].as_u64().unwrap_or(0) * 1000;
         let pistes = (nombre > 0 && duree_ms > 0).then(|| {
@@ -4288,6 +4299,10 @@ mod tests {
             brut["release_type"], "single",
             "prémisse : ce que Qobuz rend"
         );
+        assert_eq!(
+            brut["product_type"], "single",
+            "prémisse : ce que Qobuz rend"
+        );
         let album = QobuzService::map_album(&brut);
         assert_eq!(
             album.release_type.as_deref(),
@@ -4312,6 +4327,25 @@ mod tests {
             QobuzService::map_album(&brut).release_type.as_deref(),
             Some("single"),
             "3 titres, 11 min 33 : la règle de #5616"
+        );
+    }
+
+    /// Le classement de Qobuz est lu là où il est : `release_type`, à défaut
+    /// `product_type`, et `epmini` (le mot de Qobuz pour un EP) donne un EP.
+    #[test]
+    fn le_classement_de_qobuz_est_lu_dans_release_type_puis_product_type() {
+        let mut brut: serde_json::Value = serde_json::from_str(RIVERSIDE_ALBUM_GET).unwrap();
+        brut.as_object_mut().unwrap().remove("release_type");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("single"),
+            "product_type seul"
+        );
+        brut["release_type"] = json!("epmini");
+        brut["title"] = json!("Riverside");
+        assert_eq!(
+            QobuzService::map_album(&brut).release_type.as_deref(),
+            Some("ep")
         );
     }
 
