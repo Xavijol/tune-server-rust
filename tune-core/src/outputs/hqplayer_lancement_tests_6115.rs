@@ -168,3 +168,88 @@ async fn l_enchainement_sans_blanc_n_arrete_rien() {
     assert_eq!(faux.playlist(), vec![COURANTE, SUIVANTE]);
     assert_eq!(faux.joue(), (Some(COURANTE.to_string()), 2));
 }
+
+/// #6115 (suite) — un faux HQPlayer réglé comme le moteur 6.0.4 mesuré par
+/// le pont LMS-HQPlayer de Simon Arnold : `clear="1"` ignoré dans TOUS les
+/// états (`PlaylistAdd` répond OK et ajoute), `PlaylistClear` qui vide.
+/// Déjà sondé une fois, comme le fait le sondeur.
+async fn faux_6_0_4(etat: u8) -> (FauxHqplayer, HqplayerOutput) {
+    let faux = FauxHqplayer::en_lecture(COURANTE, 60.0, 300.0).await;
+    faux.regler(|e| {
+        e.ignore_clear_toujours = true;
+        e.etat = etat;
+    });
+    let sortie = faux.sortie();
+    let _ = sortie.get_status().await.unwrap();
+    (faux, sortie)
+}
+
+/// LE CAS DE PIERO (fil 2240, rc4) : « If I select another song the previous
+/// continue to play instead of the new. This is happening even if I stop the
+/// previous one. » HQPlayer ARRÊTÉ, un autre titre : sans `PlaylistClear`, la
+/// playlist devient [précédent, nouveau] et `Play` repart sur le précédent.
+#[tokio::test]
+async fn arrete_puis_un_autre_titre_joue_le_nouveau() {
+    let (faux, sortie) = faux_6_0_4(0).await;
+
+    sortie.play_media(&media(AUTRE)).await.unwrap();
+
+    assert_eq!(
+        faux.joue(),
+        (Some(AUTRE.to_string()), 2),
+        "#6115 à l'arrêt : HQPlayer rejoue le titre précédent ; `clear=\"1\"` \
+         ignoré, la playlist n'a pas été vidée. Reçu {:?}",
+        faux.recu()
+    );
+    assert_eq!(faux.playlist(), vec![AUTRE]);
+    assert!(
+        !faux.recu().iter().any(|c| c.starts_with("<Stop")),
+        "à l'arrêt, toujours aucun `Stop` : {:?}",
+        faux.recu()
+    );
+}
+
+/// Même moteur, en pleine lecture puis en pause : l'arrêt de #6180 ne suffit
+/// pas si `clear="1"` est ignoré aussi à l'arrêt.
+#[tokio::test]
+async fn en_lecture_ou_en_pause_un_autre_titre_joue_le_nouveau() {
+    for etat in [2u8, 1] {
+        let (faux, sortie) = faux_6_0_4(etat).await;
+
+        sortie.play_media(&media(AUTRE)).await.unwrap();
+
+        assert_eq!(
+            faux.joue(),
+            (Some(AUTRE.to_string()), 2),
+            "état {etat} : reçu {:?}",
+            faux.recu()
+        );
+        assert_eq!(faux.playlist(), vec![AUTRE], "état {etat}");
+    }
+}
+
+/// L'ordre sur le fil, celui du chargement vérifié en direct par le pont
+/// LMS : `Stop` (si une piste joue), `PlaylistClear`, `PlaylistAdd`, `Play`.
+#[tokio::test]
+async fn l_ordre_est_stop_playlistclear_playlistadd_play() {
+    let (faux, sortie) = faux_6_0_4(2).await;
+
+    sortie.play_media(&media(AUTRE)).await.unwrap();
+
+    let recu = faux.recu();
+    let transport: Vec<&str> = recu
+        .iter()
+        .map(String::as_str)
+        .filter(|c| !c.starts_with("<Status"))
+        .collect();
+    assert_eq!(
+        transport,
+        vec![
+            "<Stop />",
+            "<PlaylistClear />",
+            &format!(r#"<PlaylistAdd uri="{AUTRE}" queued="0" clear="1"></PlaylistAdd>"#),
+            "<Play />",
+        ],
+        "{recu:?}"
+    );
+}

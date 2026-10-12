@@ -35,6 +35,10 @@ pub(crate) struct EtatFaux {
     /// #6115 — le comportement signalé en rc4 : tant que la lecture n'est
     /// pas ARRÊTÉE (état 0), `PlaylistAdd clear="1"` est ignoré.
     pub(crate) ignore_clear_hors_arret: bool,
+    /// #6115 (suite) — le moteur 6.0.4 tel que le pont LMS-HQPlayer de Simon
+    /// Arnold l'a mesuré : `clear="1"` est ignoré dans TOUS les états,
+    /// arrêt compris ; `PlaylistAdd` répond OK et ajoute.
+    pub(crate) ignore_clear_toujours: bool,
     /// #6115 — nombre de `Status` rendus en état 3 (STOPREQ) après un
     /// `Stop`, avant l'état 0. Zéro : arrêt immédiat.
     pub(crate) status_avant_arret: u32,
@@ -100,7 +104,7 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
         if vide && etat.ignore_clear_hors_arret && etat.etat != 0 {
             return r#"<PlaylistAdd result="OK" />"#.into();
         }
-        if vide {
+        if vide && !etat.ignore_clear_toujours {
             etat.playlist.clear();
             etat.courante = 0;
         }
@@ -108,6 +112,19 @@ fn repondre(etat: &mut EtatFaux, ligne: &str) -> String {
             etat.playlist.push(uri);
         }
         return r#"<PlaylistAdd result="OK" />"#.into();
+    }
+    if ligne.starts_with("<PlaylistClear") {
+        // #6115 (suite) — pont LMS, moteur 6.0.4 : en lecture, la piste qui
+        // joue reste et le reste part (mesuré). À l'arrêt, tout part : DÉDUIT
+        // de son `Stop`, `PlaylistClear`, `PlaylistAdd`, `Play` qui change
+        // proprement de titre, pas mesuré à part.
+        if etat.etat == 0 {
+            etat.playlist.clear();
+        } else if let Some(joue) = etat.playlist.get(etat.courante).cloned() {
+            etat.playlist = vec![joue];
+        }
+        etat.courante = 0;
+        return r#"<PlaylistClear result="OK" />"#.into();
     }
     if ligne.starts_with("<PlaylistRemove") {
         if let Some(i) = attribut(ligne, "index").and_then(|v| v.parse::<usize>().ok())
