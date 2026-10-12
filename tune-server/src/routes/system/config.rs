@@ -446,6 +446,16 @@ pub(super) async fn get_config(
             tune_core::taches_de_fond::perimetre::CLE_RACINES_EXCLUES,
             json!([]),
         ),
+        // #6198 — les genres de la passe CLAP : retenus (vide : tous) et
+        // écartés (vide : aucun). Ils ne touchent que le CLAP.
+        (
+            tune_core::taches_de_fond::perimetre::CLE_GENRES_CLAP_INCLUS,
+            json!([]),
+        ),
+        (
+            tune_core::taches_de_fond::perimetre::CLE_GENRES_CLAP_EXCLUS,
+            json!([]),
+        ),
         // `replaygain_analysis_enabled` n'est PAS ici : il est publié plus bas
         // avec le bloc `replaygain_source`, par un `insert` inconditionnel qui
         // normalise en plus la valeur persistée (`"false"` → `false`). Une
@@ -1236,6 +1246,24 @@ fn normaliser_perimetre_des_analyses(
     Ok(true)
 }
 
+/// #6198 — les genres de la passe CLAP, retenus et écartés : la même forme
+/// que les racines exclues (tableau de chaînes, rognées, sans vide ni
+/// doublon, `null` = vide), refusée en 400 sinon. Ils ne touchent pas
+/// ReplayGain : aucune campagne à refermer.
+fn normaliser_genres_du_clap(values: &mut serde_json::Map<String, Value>) -> Result<(), AppError> {
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, normaliser,
+    };
+    for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+        let Some(brut) = values.get(cle) else {
+            continue;
+        };
+        let liste = normaliser(brut).map_err(|e| AppError::bad_request(format!("{cle} : {e}")))?;
+        values.insert(cle.to_string(), json!(liste));
+    }
+    Ok(())
+}
+
 fn normaliser_plafond_aleatoire(
     values: &mut serde_json::Map<String, Value>,
 ) -> Result<(), AppError> {
@@ -1432,6 +1460,7 @@ pub(super) async fn update_config(
     normaliser_vitesse_des_analyses(&mut values)?;
     let politique_de_lecture = normaliser_politique_de_lecture(&mut values)?;
     let perimetre_touche = normaliser_perimetre_des_analyses(&mut values)?;
+    normaliser_genres_du_clap(&mut values)?;
     let intervalle_reseau_demande = normaliser_intervalle_reseau(&mut values)?;
     let scan_au_demarrage_efface = normaliser_scan_au_demarrage(&mut values)?.is_some();
     let full_volume_confirmed = take_full_volume_confirmation(&mut values);
@@ -5609,6 +5638,82 @@ mod politique_de_lecture_4681_tests {
             normaliser_politique_de_lecture(&mut vide),
             Ok(None)
         ));
+    }
+}
+
+#[cfg(test)]
+mod genres_du_clap_6198_tests {
+    use super::{get_config, normaliser_genres_du_clap};
+    use crate::routes::active_profile::{ActiveProfile, DEFAULT_PROFILE_ID};
+    use crate::state::AppState;
+    use axum::extract::State;
+    use axum::http::HeaderMap;
+    use serde_json::{Value, json};
+    use tune_core::db::settings_repo::SettingsRepo;
+    use tune_core::taches_de_fond::perimetre::{
+        CLE_GENRES_CLAP_EXCLUS, CLE_GENRES_CLAP_INCLUS, genres_clap_exclus, genres_clap_inclus,
+    };
+
+    /// Publiés vides par défaut, puis tels qu'écrits ; le moteur relit la même
+    /// chose que la route publie.
+    #[tokio::test]
+    async fn les_genres_du_clap_sont_publies_puis_relus() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(c[CLE_GENRES_CLAP_INCLUS], json!([]), "{c}");
+        assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
+
+        let mut v: serde_json::Map<String, Value> = json!({
+            CLE_GENRES_CLAP_INCLUS: [" Jazz ", "", "Jazz", "Classique"],
+            CLE_GENRES_CLAP_EXCLUS: null,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(normaliser_genres_du_clap(&mut v).is_ok());
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        for (k, val) in v {
+            settings.set(&k, &val.to_string()).unwrap();
+        }
+        let c = get_config(
+            HeaderMap::new(),
+            ActiveProfile(DEFAULT_PROFILE_ID),
+            State(state.clone()),
+        )
+        .await
+        .0;
+        assert_eq!(
+            c[CLE_GENRES_CLAP_INCLUS],
+            json!(["Jazz", "Classique"]),
+            "{c}"
+        );
+        assert_eq!(c[CLE_GENRES_CLAP_EXCLUS], json!([]), "{c}");
+        assert_eq!(
+            genres_clap_inclus(&state.backend),
+            vec!["Jazz", "Classique"]
+        );
+        assert!(genres_clap_exclus(&state.backend).is_empty());
+    }
+
+    /// Une forme qui se relirait « tous les genres » en silence est refusée.
+    #[test]
+    fn une_forme_illisible_est_refusee() {
+        for cle in [CLE_GENRES_CLAP_INCLUS, CLE_GENRES_CLAP_EXCLUS] {
+            for mauvais in [json!("Jazz"), json!(4), json!([1]), json!({})] {
+                let mut v: serde_json::Map<String, Value> =
+                    json!({ cle: mauvais.clone() }).as_object().unwrap().clone();
+                assert!(
+                    normaliser_genres_du_clap(&mut v).is_err(),
+                    "{cle} = {mauvais}"
+                );
+            }
+        }
     }
 }
 
