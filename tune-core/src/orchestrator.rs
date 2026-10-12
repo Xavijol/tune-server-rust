@@ -1807,6 +1807,10 @@ mod crossfeed_bibliotheque_reseau;
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
 
+// #4354 — repli à 176,4 kHz d'un DSD décimé qui manque son pré-tampon.
+#[cfg(test)]
+mod repli_dsd_4354_tests;
+
 // #5871 — la préparation DSP ne fait plus la queue derrière l'écrivain.
 #[cfg(test)]
 mod prepa_lecture_5871_tests;

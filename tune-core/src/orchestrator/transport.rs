@@ -851,6 +851,21 @@ impl PlaybackOrchestrator {
             )
             .await;
 
+        // #4354 — la barrière a posé un repli DSD à 176,4 kHz : rien n'est
+        // parti au renderer. La session trop lente est fermée et la même
+        // demande est rejouée ; la seconde résolution sert 176,4 kHz, sous
+        // la cadence de repli, donc ne peut pas reboucler.
+        if output_error.as_deref() == Some(crate::audio::repli_dsd_4354::REJOUER_AVEC_LE_REPLI) {
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            // Le premier passage a inscrit cette piste comme « déjà envoyée » :
+            // sans ce retrait, la garde anti-doublon réseau avalerait la
+            // seconde résolution, alors que rien n'est parti au renderer.
+            self.last_net_play.lock().await.remove(&req.zone_id);
+            return Box::pin(self.play_inner(req, record_history)).await;
+        }
+
         // For local outputs, clean up the old stream now that play_url() has
         // called stop() and the old audio thread is no longer reading.
         if is_local {
@@ -1448,6 +1463,39 @@ impl PlaybackOrchestrator {
                         prebuffer_ms,
                         "initial_prebuffer_done"
                     );
+                    // #4354 — décision de Bertrand du 12/10 : un DSD décimé
+                    // au-dessus de 176,4 kHz qui n'a pas rempli sa barrière
+                    // jouerait haché. Rien n'est encore parti au renderer :
+                    // on pose le repli de la zone et `play_inner` résout la
+                    // piste une seconde fois, à 176,4 kHz.
+                    if !is_radio {
+                        let mode = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
+                            .get_dsd_mode(req.zone_id);
+                        let transport_pcm = crate::orchestrator::transport_dsd(false, true, &mode)
+                            == crate::orchestrator::TransportDsd::Pcm;
+                        if let Some(repli) = crate::audio::repli_dsd_4354::decider(
+                            reached,
+                            local_file_path.as_deref(),
+                            &resolved.mime_type,
+                            resolved.sample_rate,
+                            transport_pcm,
+                        ) {
+                            crate::audio::repli_dsd_4354::enregistrer(req.zone_id, repli);
+                            warn!(
+                                zone_id = req.zone_id,
+                                stream_id = %sid,
+                                de_hz = repli.de_hz,
+                                vers_hz = repli.vers_hz,
+                                prebuffer_ms,
+                                raison = %repli.raison(),
+                                "dsd_pcm_repli_176k"
+                            );
+                            return (
+                                false,
+                                Some(crate::audio::repli_dsd_4354::REJOUER_AVEC_LE_REPLI.into()),
+                            );
+                        }
+                    }
                 }
             }
 

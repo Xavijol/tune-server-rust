@@ -2246,6 +2246,29 @@ impl PlaybackOrchestrator {
             cible_encodable(src_fmt.dlna_transcode_target())
         };
         let mut out_sr = src_fmt.dsd_output_sample_rate(sample_rate);
+        // #4354 — la zone a déjà manqué son pré-tampon sur un DSD décimé :
+        // la décimation vise 176,4 kHz. Seulement pour un DSD servi en PCM
+        // à une sortie réseau (jamais en DoP, dont les bits ne se déciment
+        // pas).
+        if src_fmt == AudioFormat::Dsd
+            && is_network_output
+            && transport_dsd(
+                false,
+                true,
+                &ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+            ) == TransportDsd::Pcm
+        {
+            let apres = crate::audio::repli_dsd_4354::cadence_apres_repli(req.zone_id, out_sr);
+            if apres != out_sr {
+                info!(
+                    zone_id = req.zone_id,
+                    de_hz = out_sr,
+                    vers_hz = apres,
+                    "dsd_pcm_repli_176k_applique"
+                );
+                out_sr = apres;
+            }
+        }
         // Apply zone max_sample_rate cap
         if let Some(max_sr) = zone_max_sample_rate {
             if out_sr > max_sr {
