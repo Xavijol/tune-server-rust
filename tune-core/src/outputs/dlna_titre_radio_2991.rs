@@ -241,7 +241,11 @@ impl DlnaOutput {
             return Err(format!("{action} rejected: {reponse}"));
         }
         if mode == ModeTitreRadioDidl::Recharger {
+            // #6008 — un rechargement EST une pose d'URI : un renderer qui
+            // remonte son volume à chaque pose le ferait à chaque titre.
+            self.noter_pose_d_uri();
             self.relancer_si_arrete_apres_rechargement().await;
+            self.reimposer_le_volume_apres_uri().await;
         }
         Ok(IssueRelai::Envoye { action })
     }
