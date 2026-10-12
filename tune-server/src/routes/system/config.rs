@@ -303,6 +303,11 @@ pub(super) async fn get_config(
         if k.starts_with(&format!("{UI_PREFERENCES}:")) {
             continue;
         }
+        // #5916 — le profil choisi par chaque appareil (clé : son adresse IP)
+        // n'est le réglage de personne, et ne se publie pas.
+        if k.starts_with(crate::routes::profil_par_appareil::PREFIXE) {
+            continue;
+        }
         // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
         // n'est le réglage de personne, et la publier ici la ferait passer
         // pour le réglage auprès du client qui lit ce nom en premier.

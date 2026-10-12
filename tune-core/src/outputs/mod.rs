@@ -38,6 +38,8 @@ pub mod dlna_repli_set_uri;
 mod dlna_repli_set_uri_tests;
 #[cfg(test)]
 mod dlna_test;
+#[cfg(test)]
+mod dlna_volume_apres_uri_tests_6008;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
