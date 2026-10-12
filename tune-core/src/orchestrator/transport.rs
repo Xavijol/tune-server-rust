@@ -703,6 +703,9 @@ impl PlaybackOrchestrator {
         record_history: bool,
     ) -> Result<PlayResult, String> {
         let play_start = std::time::Instant::now();
+        // #5050 — une lecture part : la pose « en pause sans lancer » d'un
+        // transfert ne vaut plus.
+        self.prendre_le_transfert_en_pause(req.zone_id);
         // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
         // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
         // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
@@ -3034,8 +3037,15 @@ impl PlaybackOrchestrator {
             // Les accolades rendent le verrou de `outputs` AVANT de prendre celui
             // de la sortie : sans elles, le garde vivrait tout le `match`
             // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
+            // #5050 (fil 2236) — posée en pause par un transfert : l'appareil
+            // n'a jamais reçu la piste, rien à reprendre sur place.
+            let transfert_en_pause = self.prendre_le_transfert_en_pause(zone_id);
+            if transfert_en_pause {
+                info!(zone_id, position_ms, "resume_apres_transfert_en_pause");
+            }
             #[allow(clippy::blocks_in_conditions)]
             let peripherique_rendu = apres_refus_de_la_sortie
+                || transfert_en_pause
                 || match device_id {
                     Some(did) => match { self.outputs.lock().await.get(did) } {
                         Some(sortie) => sortie.lock().await.device_released_on_pause(),
@@ -3257,6 +3267,8 @@ impl PlaybackOrchestrator {
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         // #5476 — rend caduc un Seek de reprise détaché encore en attente.
         self.playback.marquer_commande_de_transport(zone_id).await;
+        // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
+        self.prendre_le_transfert_en_pause(zone_id);
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
