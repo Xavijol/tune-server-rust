@@ -70,6 +70,7 @@ pub mod playlist_manager;
 pub mod playlists;
 pub mod plugins;
 pub mod podcasts;
+pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_libelles;
