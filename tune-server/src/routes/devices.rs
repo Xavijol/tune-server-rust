@@ -1418,11 +1418,10 @@ async fn list_audio_devices(State(state): State<AppState>) -> Json<Value> {
         // l'ordonnanceur : un balayage bloqué dans le greffon ALSA de PipeWire
         // y garait un fil par chargement de page, jusqu'à ce que le serveur ne
         // réponde plus du tout.
-        let devices = if crate::background::any_local_output_playing(&state).await {
-            tune_core::outputs::local::cached_audio_devices()
-        } else {
-            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend).await
-        };
+        let devices = crate::background::parc_local_sans_couper_la_lecture(&state, || {
+            tune_core::outputs::local::list_audio_devices_with_backend_bounded(backend)
+        })
+        .await;
         // Publier l'identifiant de registre à côté du nom.
         //
         // Cette charge utile n'en portait aucun, et un client qui veut créer

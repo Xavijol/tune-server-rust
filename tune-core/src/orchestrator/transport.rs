@@ -724,6 +724,13 @@ impl PlaybackOrchestrator {
         // lit `req.track_id`.
         self.resoudre_l_uri_en_piste_de_bibliotheque(&mut req);
 
+        // #2264 — la RÈGLE DE VERSION, au point unique où une demande devient
+        // une lecture : piste, playlist, favori, file, historique, reprise y
+        // passent tous. Elle peut remplacer la piste demandée par un autre
+        // exemplaire du même enregistrement (bibliothèque, service), et dit
+        // pourquoi ; la piste en cours le publiera (`NowPlaying::version`).
+        let version_jouee = self.appliquer_la_regle_de_version(&mut req).await;
+
         // Clean up any gapless-prepared session for this zone before
         // creating a new stream.
         self.cleanup_gapless_session(req.zone_id).await;
@@ -781,7 +788,8 @@ impl PlaybackOrchestrator {
             cover_path: req.cover_url.clone().or(resolved.cover_url.clone()),
             album: req.album_title.clone().or(resolved.album.clone()),
         };
-        let np = self.composer_le_now_playing(&req, &resolved, &habillage);
+        let mut np = self.composer_le_now_playing(&req, &resolved, &habillage);
+        np.version = version_jouee;
 
         // Ticket 134 — la session REMPLACÉE se lit au moment du remplacement,
         // pas au départ de cette lecture : une autre lecture a pu s'intercaler
@@ -822,6 +830,16 @@ impl PlaybackOrchestrator {
             .as_deref()
             .is_some_and(|id| id.starts_with("local:"));
         if !is_local {
+            // #6130 — sortie DLNA qui jouait une radio : `Stop`, puis attendre
+            // que le renderer ait lâché la connexion de la radio (au plus 2 s),
+            // AVANT de fermer la session et de poser la nouvelle URI.
+            self.sortir_de_la_radio_dlna(
+                req.zone_id,
+                req.output_device_id.as_deref(),
+                prev_state.now_playing.as_ref(),
+                &sessions_a_fermer,
+            )
+            .await;
             for sid in &sessions_a_fermer {
                 self.streamer.remove_session(sid).await;
             }
@@ -1254,13 +1272,16 @@ impl PlaybackOrchestrator {
                 .as_ref()
                 .and_then(|t| u16::try_from(t.channels).ok())
                 .filter(|n| *n > 0),
+            // #2264 — posé par `play_inner` après la composition : c'est la
+            // décision de `appliquer_la_regle_de_version`.
+            version: None,
         }
     }
 
     /// Quatrième temps : l'envoi à la sortie. Rend `(output_sent,
     /// output_error)`, le couple dont dépendent l'annonce, l'historique et
     /// l'arrêt immédiat en cas de refus.
-    async fn envoyer_a_la_sortie(
+    pub(super) async fn envoyer_a_la_sortie(
         &self,
         req: &PlayRequest,
         resolved: &ResolvedStream,
@@ -1428,6 +1449,31 @@ impl PlaybackOrchestrator {
                         "initial_prebuffer_done"
                     );
                 }
+            }
+
+            // #5522 — le producteur de la session est déjà mort (téléchargement
+            // amont refusé, `abandonner_la_session_de_transcodage`) : la
+            // session n'existe plus. L'envoyer quand même faisait tirer à la
+            // sortie un `/stream/<id>` en 404, et la zone restait « en
+            // lecture » à 0:00 sans bandeau (Gros Bidon, fil 2212). On ne
+            // l'envoie pas : `output_sent=false` avec un motif arrête la zone
+            // et affiche ce motif, comme un refus de la sortie.
+            if let Some(ref sid) = resolved.stream_id
+                && !self.streamer.session_alive(sid).await
+            {
+                warn!(
+                    zone_id = req.zone_id,
+                    stream_id = %sid,
+                    source = %resolved.source,
+                    "envoi_annule_session_de_flux_abandonnee"
+                );
+                return (
+                    false,
+                    Some(format!(
+                        "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
+                        resolved.title, resolved.source
+                    )),
+                );
             }
 
             // A local output opens this URL in its own reader thread just
@@ -1814,6 +1860,10 @@ impl PlaybackOrchestrator {
                     // 0 dB » au lieu d'un préampli qui ne fait rien.
                     self.playback
                         .brancher_le_gain_demande(zone_id, local_output.gain_demande());
+                    // #4969 — et sa carte des canaux : les niveaux par canal
+                    // décrivent les voies qui sortent, après réaffectation.
+                    self.playback
+                        .brancher_la_carte_des_canaux(zone_id, local_output.sonde_des_canaux());
                     return;
                 }
             }
@@ -2073,10 +2123,37 @@ impl PlaybackOrchestrator {
                     // `false` en mode PURE, donc la promesse bit-perfect tient
                     // sans garde supplémentaire, exactement comme pour l'EQ.
                     local_output.set_mono_downmix(self.zone_mono_downmix(zone_id));
+                    // #6044 — la réaffectation des canaux : la règle de l'album
+                    // prime sur celle de la zone, et aucune ne s'applique en
+                    // PURE (`regle_effective_with` le vérifie). Les canaux de
+                    // la source sont ceux du flux résolu, sinon ceux de la
+                    // piste en base.
+                    local_output.set_reaffectation(self.reaffectation_de_la_piste(
+                        zone_id,
+                        track_id,
+                        media.channels,
+                    ));
+                    // #6057 — la disposition des canaux que le FICHIER déclare
+                    // (masque WAV/FLAC, type DSF, CHNL DFF), pour router chaque
+                    // voie par sa position. Rien en PURE : chemin intouché.
+                    local_output.set_disposition_source(if zone_audiophile {
+                        None
+                    } else {
+                        self.disposition_declaree(track_id, media.file_path)
+                    });
                     // Rampe anti-« ploc » à la pause / reprise / arrêt (#1590),
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.
                     local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+                    // #2211 — fondu enchaîné, sortie LOCALE uniquement : `0` en
+                    // PURE et en bit-perfect strict (`duree_appliquee_ms`), et
+                    // pour un flux en direct, qui n'a pas de piste suivante et
+                    // dont la réserve retarderait le démarrage.
+                    local_output.set_fondu_enchaine_ms(if media.live_stream {
+                        0
+                    } else {
+                        crate::audio::fondu_de_zone::duree_appliquee_ms(&self.db, zone_id)
+                    });
                 }
                 drop(output);
             }
@@ -2267,6 +2344,18 @@ impl PlaybackOrchestrator {
             .await
             .now_playing
             .and_then(|np| np.stream_id);
+        // #6059 — un flux natif qui commence DÉJÀ à la position : un `Seek`
+        // par-dessus le décalerait d'autant (et le renderer l'ignore).
+        if let Some(depart_ms) = stream_id
+            .as_deref()
+            .and_then(crate::outputs::dlna_depart_natif::depart_de_session)
+        {
+            info!(
+                zone_id,
+                position_ms, depart_ms, "seek_natif_flux_deja_a_la_position"
+            );
+            return;
+        }
         let session_is_range_seekable = match stream_id {
             Some(ref sid) => self.streamer.is_seekable_session(sid).await,
             None => false,
@@ -2785,6 +2874,24 @@ impl PlaybackOrchestrator {
         device_id: Option<&str>,
         session_message: impl Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync,
     ) -> OutputCommandResult<()> {
+        self.reprendre(zone_id, device_id, &session_message, false)
+            .await
+    }
+
+    /// Corps de [`Self::resume_with_session_error_message`].
+    ///
+    /// `apres_refus_de_la_sortie` (#6062) : second et dernier passage, quand
+    /// la sortie a refusé la reprise « sur place » en disant qu'elle a perdu
+    /// sa session pendant la pause (`device_released_on_pause()` devenu
+    /// vrai). La décision est alors prise comme pour un périphérique rendu :
+    /// rétablir à la position, ou l'expliquer — jamais un second `resume()`.
+    async fn reprendre(
+        &self,
+        zone_id: i64,
+        device_id: Option<&str>,
+        session_message: &MessageDeSessionPerdue<'_>,
+        apres_refus_de_la_sortie: bool,
+    ) -> OutputCommandResult<()> {
         // #5476 — génération de CETTE reprise, prise avant le `Play` : toute
         // commande arrivée depuis rend caduc le Seek détaché qu'elle lancera.
         let seq_de_la_reprise = self.playback.marquer_commande_de_transport(zone_id).await;
@@ -2880,13 +2987,14 @@ impl PlaybackOrchestrator {
             // de la sortie : sans elles, le garde vivrait tout le `match`
             // (clippy 1.98, `blocks_in_conditions`, à ne pas suivre ici).
             #[allow(clippy::blocks_in_conditions)]
-            let peripherique_rendu = match device_id {
-                Some(did) => match { self.outputs.lock().await.get(did) } {
-                    Some(sortie) => sortie.lock().await.device_released_on_pause(),
+            let peripherique_rendu = apres_refus_de_la_sortie
+                || match device_id {
+                    Some(did) => match { self.outputs.lock().await.get(did) } {
+                        Some(sortie) => sortie.lock().await.device_released_on_pause(),
+                        None => false,
+                    },
                     None => false,
-                },
-                None => false,
-            };
+                };
             if peripherique_rendu {
                 info!(
                     zone_id,
@@ -3023,7 +3131,25 @@ impl PlaybackOrchestrator {
             })?;
             let out = output.lock().await;
             let t = out.output_type().to_string();
-            out.checked_resume().await?;
+            if let Err(refus) = out.checked_resume().await {
+                // #6062 — la sortie dit avoir perdu sa session pendant la
+                // pause (Chromecast dont l'application s'est refermée) : la
+                // reprise sur place ne relancera rien, on rétablit à la
+                // position. Une seule fois : le second passage ne revient
+                // jamais ici.
+                if !apres_refus_de_la_sortie && out.device_released_on_pause() {
+                    drop(out);
+                    info!(
+                        zone_id,
+                        position_ms,
+                        error = %refus,
+                        "resume_session_perdue_par_la_sortie_retablissement"
+                    );
+                    return Box::pin(self.reprendre(zone_id, device_id, session_message, true))
+                        .await;
+                }
+                return Err(refus);
+            }
             Some(t)
         } else {
             None
@@ -3521,8 +3647,35 @@ impl PlaybackOrchestrator {
                 zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
             let is_oaat_output = zone_output_type.as_deref() == Some("oaat");
             let has_track = state.now_playing.is_some();
+            // #6017 (Cyrille, fil 2194, Yamaha R-N2000A) — une piste de la
+            // BIBLIOTHÈQUE convertie à la volée (AAC → WAV) est servie par un
+            // canal, sans `Range`, et la DIDL annonce `DLNA.ORG_OP=00`. Un
+            // `Seek` SOAP nu y est refusé à bon droit par le renderer (« code
+            // UPnP inconnu »). On recrée donc le flux À la position, comme
+            // pour une sortie locale et comme le transfert (#4442).
+            let bibliotheque_sans_range_sur_reseau = is_network
+                && match state.now_playing.as_ref() {
+                    Some(np) if np.source == "local" => match np.stream_id {
+                        Some(ref sid) => !self.streamer.is_seekable_session(sid).await,
+                        None => false,
+                    },
+                    _ => false,
+                };
 
-            if (is_local_output || is_oaat_output) && has_track {
+            if bibliotheque_sans_range_sur_reseau {
+                info!(
+                    zone_id,
+                    position_ms, "seek_bibliotheque_sans_range_recreation_du_flux"
+                );
+                if let Err(e) = self
+                    .replay_zone_at_position(zone_id, position_ms, "seek")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_bibliotheque_sans_range_echouee");
+                    self.playback.seek(zone_id, original_position_ms).await;
+                    return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                }
+            } else if (is_local_output || is_oaat_output) && has_track {
                 info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                 match self
                     .replay_zone_at_position(zone_id, position_ms, "seek")
@@ -3541,6 +3694,19 @@ impl PlaybackOrchestrator {
                     }
                 }
             } else {
+                // #6059 — un renderer profilé « Seek inopérant » (Yamaha
+                // R-N2000A) : le flux natif est relancé à la position.
+                if let Some(resultat) = self
+                    .deplacer_en_flux_natif_6059(zone_id, did, position_ms, state)
+                    .await
+                {
+                    if let Err(e) = resultat {
+                        warn!(zone_id, error = %e, "seek_natif_echoue");
+                        self.playback.seek(zone_id, original_position_ms).await;
+                        return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                    }
+                    return Ok(());
+                }
                 let output = { self.outputs.lock().await.get(did) }.ok_or_else(|| {
                     OutputCommandError::failed(
                         OutputCommand::Seek,
@@ -3548,6 +3714,21 @@ impl PlaybackOrchestrator {
                     )
                 })?;
                 output.lock().await.checked_seek(position_ms).await?;
+                // #6059 — un fichier natif sur une zone DLNA : le sondeur
+                // vérifiera que le renderer a bien exécuté ce `Seek`.
+                if zone_output_type.as_deref() == Some("dlna")
+                    && let Some(np) = state.now_playing.as_ref()
+                    && np.source == "local"
+                    && let Some(sid) = np.stream_id.as_deref()
+                    && self.fichier_natif_de_session(sid).await.is_some()
+                {
+                    super::seek_natif_6059::noter_seek_envoye(
+                        zone_id,
+                        did,
+                        original_position_ms.max(0) as u64,
+                        position_ms,
+                    );
+                }
             }
         }
         Ok(())
@@ -3565,6 +3746,11 @@ impl PlaybackOrchestrator {
         self.streamer.session_alive(stream_id).await
     }
 }
+
+/// #6062 — la traduction, fournie par l'appelant, du message d'une session
+/// perdue (#4193) : `(titre, position mesurée, erreur)`.
+type MessageDeSessionPerdue<'a> =
+    dyn Fn(&str, Option<u64>, Option<&str>) -> String + Send + Sync + 'a;
 
 /// Ticket 134 — les sessions de flux qu'une lecture doit fermer une fois la
 /// sortie basculée sur la sienne.

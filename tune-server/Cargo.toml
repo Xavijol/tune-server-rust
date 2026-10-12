@@ -216,6 +216,11 @@ path = "tests/pont_lien_d_acces.rs"
 [[test]]
 name = "sendspin_mode_transition"
 path = "tests/sendspin_mode_transition.rs"
+# #4626 — rôle maître / agent : deux serveurs Tune réels, appairage, zone,
+# flux, pause, volume. `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "agent_tune_4626"
+path = "tests/agent_tune_4626.rs"
 
 [[test]]
 name = "server_contracts"
@@ -375,6 +380,12 @@ path = "tests/radios_libelles_localises.rs"
 name = "favori_bandcamp_survit_a_la_resignature_4577"
 path = "tests/favori_bandcamp_survit_a_la_resignature_4577.rs"
 
+# #5677 — l'écriture d'une passe d'indexation UPnP (synchronisation horaire)
+# ne tient pas un fil de l'exécuteur. Rangée au MILIEU du manifeste.
+[[test]]
+name = "indexation_upnp_hors_executeur_5677"
+path = "tests/indexation_upnp_hors_executeur_5677.rs"
+
 # #4154 — les trois plafonds de l'indexation UPnP : réglables, mémorisés, et
 # qui DISENT quand ils mordent. Mesuré sur les routes montées.
 #
@@ -477,6 +488,15 @@ required-features = ["postgres"]
 [[test]]
 name = "pg_2372_versions_par_piste"
 path = "tests/pg_2372_versions_par_piste.rs"
+required-features = ["postgres"]
+
+# #2264 : `GET /library/tracks/{id}/versions/groups` ajoute une requete par
+# ISRC plie / MBID d enregistrement. Meme reponse sur PostgreSQL et SQLite,
+# et une mesure ignoree sur 100 000 pistes. `autotests = false` : sans cette
+# entree, le fichier ne serait jamais compile.
+[[test]]
+name = "pg_2264_groupes_versions"
+path = "tests/pg_2264_groupes_versions.rs"
 required-features = ["postgres"]
 
 # SQL propre a SQLite dans des routes jouees sur PostgreSQL (chasse PG du
@@ -906,6 +926,14 @@ path = "tests/album_de_la_file_fil2143.rs"
 [[test]]
 name = "artiste_de_la_file_fil2143"
 path = "tests/artiste_de_la_file_fil2143.rs"
+
+# #6079 (FabienM) — les identifiants de SERVICE d'un titre de la file :
+# `album_id_service` et `artist_id_service` sur `GET /zones/{id}/queue` pour un
+# titre Qobuz ou Tidal mis seul en file, en lot, ou lu dans son album.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "identifiants_de_service_en_file_6079"
+path = "tests/identifiants_de_service_en_file_6079.rs"
 
 # Fil 1906 (FabienM), point 3 — « Plus comme ça » sur un titre Qobuz :
 # `/streaming/{service}/tracks/{track_id}/similar` par le routeur monté, avec
@@ -1442,6 +1470,28 @@ name = "pg_etiquette_collection_5026"
 path = "tests/pg_etiquette_collection_5026.rs"
 required-features = ["postgres"]
 
+# #6121 — la règle « Artiste de l'album » (collections et playlists) sur
+# PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_artiste_de_l_album_6121"
+path = "tests/pg_artiste_de_l_album_6121.rs"
+required-features = ["postgres"]
+
+# #6122 — la règle « dans les N derniers jours » (date d'ajout, dernière
+# écoute) sur PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_date_relative_6122"
+path = "tests/pg_date_relative_6122.rs"
+required-features = ["postgres"]
+
+# #6143 — les règles de date « après », « avant », « entre » et les formes
+# relatives (`now-90d`) sur PostgreSQL, sans `DATETIME()` propre à SQLite :
+# un témoin par opérateur, collections et playlists.
+[[test]]
+name = "pg_regles_de_date_6143"
+path = "tests/pg_regles_de_date_6143.rs"
+required-features = ["postgres"]
+
 # 🔴 #4889 — `tests/playlists_pistes_de_service.rs` existe depuis #1848 et n'a
 # JAMAIS été compilé : `autotests = false` en tête de ce manifeste, et aucune
 # cible ne le déclarait. Il garde maintenant le contrat des titres de service
@@ -1532,6 +1582,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
 
+# #5997 — les routes de favoris de service passent par le miroir du service.
+[[test]]
+name = "favoris_miroir_routes_5997"
+path = "tests/favoris_miroir_routes_5997.rs"
+
 # #4805 — les crédits MusicBrainz lus juste après l'identification d'un album
 # (doublure MusicBrainz locale). `autotests = false` : sans cette cible, jamais
 # compilé.
@@ -1544,3 +1599,17 @@ path = "tests/credits_apres_identification_4805.rs"
 [[test]]
 name = "insertion_avant_la_piste_en_cours_5770"
 path = "tests/insertion_avant_la_piste_en_cours_5770.rs"
+
+# Liens et sauvegardes de `/playlist-manager` : alias dépréciés (en-tête
+# `Deprecation`) pendant une version, doublons du greffon « Playlists
+# converter ». `autotests = false` : sans cette cible, jamais compilé.
+[[test]]
+name = "playlist_manager_alias_deprecies"
+path = "tests/playlist_manager_alias_deprecies.rs"
+
+# #6124 — la date de sortie originale et la version sur PostgreSQL : règles
+# des collections et des playlists, concordance de l'album, fiche de piste.
+[[test]]
+name = "pg_balises_6124"
+path = "tests/pg_balises_6124.rs"
+required-features = ["postgres"]

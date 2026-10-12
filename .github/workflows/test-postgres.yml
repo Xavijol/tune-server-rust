@@ -109,7 +109,7 @@ jobs:
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation
     # froide de ~4 min. Un plafond ne peut que faire echouer plus tot.
-    timeout-minutes: 45
+    timeout-minutes: 75
 
     services:
       postgres:
@@ -174,6 +174,14 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+
+      # #5997 — miroir des favoris de service : écriture pour tous les profils,
+      # alignement (INSERT … SELECT … ON CONFLICT), retrait au rafraîchissement,
+      # panne. Sans cette étape, l'épreuve prendrait son saut annoncé.
+      - name: Favoris de service en miroir sur PostgreSQL (#5997)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5997 -- --nocapture --test-threads=1
 
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
@@ -669,6 +677,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2372_versions_par_piste -- --nocapture --test-threads=1
+      # #2264 -- les groupes de versions et les index d'expression ISRC/MBID
+      # sur une VRAIE base. Sans cette etape, les deux epreuves de
+      # `pg_2264_groupes_versions` sautaient partout (garde #2816).
+      - name: Groupes de versions sur PostgreSQL (#2264)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_2264_groupes_versions -- --nocapture --test-threads=1
 
       # #3256 -- ` RETURNING id` seulement la ou la colonne EXISTE, sur une
       # VRAIE base.
@@ -724,6 +739,42 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_etiquette_collection_5026 -- --nocapture --test-threads=1
+
+      # #6121 — la règle « Artiste de l'album » : COALESCE sur la balise
+      # ALBUMARTIST dans les collections, sous-requête corrélée sur
+      # `al.artist_id` dans les playlists. Les deux aperçus par le vrai
+      # routeur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Règle Artiste de l'album sur PostgreSQL (#6121)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_artiste_de_l_album_6121 -- --nocapture --test-threads=1
+
+      # #6122 — « dans les N derniers jours » : des littéraux calculés à chaque
+      # requête (secondes pour `file_mtime`, ISO pour `listened_at`) au lieu de
+      # `DATETIME('now', …)`, propre à SQLite. Sans cette étape, l'épreuve
+      # prendrait son « saut annoncé ».
+      - name: Règle « dans les N derniers jours » sur PostgreSQL (#6122)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_date_relative_6122 -- --nocapture --test-threads=1
+
+      # #6143 — « après », « avant », « entre » et `now-90d` des collections et
+      # des playlists : bornes calculées en Rust (secondes pour `file_mtime`,
+      # ISO pour `listened_at`) au lieu de `DATETIME()`, propre à SQLite. Sans
+      # cette étape, l'épreuve prendrait son « saut annoncé ».
+      - name: Règles de date des collections et playlists sur PostgreSQL (#6143)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_regles_de_date_6143 -- --nocapture --test-threads=1
+
+      # #6124 — la date de sortie originale et la version : sous-requête
+      # corrélée sur `track_metadata`, `albums.original_year` INTEGER, et la
+      # concordance des pistes d'un album (COUNT BIGINT). Sans cette étape,
+      # l'épreuve prendrait son « saut annoncé ».
+      - name: Date originale et version sur PostgreSQL (#6124)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_balises_6124 -- --nocapture --test-threads=1
 
       # #5192 — la recherche et le texte libre d'Oxygen trouvent une piste par
       # le nom de son dernier dossier et celui de son fichier. Sur la VRAIE
