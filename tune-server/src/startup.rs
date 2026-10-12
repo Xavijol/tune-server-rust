@@ -943,6 +943,13 @@ fn recalculer_les_compilations(state: &AppState) {
 /// JAMAIS un favori introuvable — un volume pas encore monté ou un scan à
 /// venir peut encore le ramener ; seule la passe post-scan complet supprime.
 fn reconcile_favorites(state: &AppState) {
+    // #6179 — les lignes de playlist introuvables : rattachées à leur piste
+    // si elle est là, conservées sinon. Jamais supprimées.
+    tune_core::db::playlists_reconcile::reconcilier_et_journaliser(
+        state.backend.clone(),
+        true,
+        "demarrage",
+    );
     let reconciler = tune_core::db::favorites_reconcile::FavoritesReconciler::with_backend(
         state.backend.clone(),
     );
