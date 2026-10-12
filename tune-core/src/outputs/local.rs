@@ -716,6 +716,10 @@ pub struct LocalOutput {
     reaffectation: Arc<CreneauReaffectation>,
     /// #6057 — la disposition déclarée par le fichier de la piste en cours.
     disposition: Arc<CreneauDisposition>,
+    /// #6171 — les canaux de la carte que la zone vise (`zone_{id}_output_channels`),
+    /// posés par piste par l'orchestrateur. Seul le bras ASIO exclusif les lit,
+    /// à l'ouverture du pilote. `None` : les premiers canaux, comme avant.
+    canaux_de_carte: std::sync::Mutex<Option<crate::outputs::canaux_de_carte_6171::CanauxDeCarte>>,
     /// Durée, en millisecondes, de la rampe de gain anti-« ploc » appliquée à la
     /// pause, à la reprise et à l'arrêt (#1590).
     ///
@@ -1234,6 +1238,7 @@ impl LocalOutput {
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
+            canaux_de_carte: std::sync::Mutex::new(None),
             // Désarmée tant que l'orchestrateur n'a pas posé la valeur de la
             // zone : une sortie construite hors chemin de lecture se comporte
             // exactement comme avant #1590.
@@ -1567,6 +1572,23 @@ impl LocalOutput {
         matrice: Option<Arc<crate::audio::reaffectation_canaux::Matrice>>,
     ) {
         self.reaffectation.poser(matrice);
+    }
+
+    /// #6171 — poser (ou retirer) les canaux de la carte que la zone vise.
+    /// Pris en compte à la prochaine ouverture du pilote ASIO (piste suivante
+    /// à un autre format, ou reprise de la lecture) ; sans effet hors ASIO.
+    pub fn set_canaux_de_carte(
+        &self,
+        canaux: Option<crate::outputs::canaux_de_carte_6171::CanauxDeCarte>,
+    ) {
+        if let Ok(mut g) = self.canaux_de_carte.lock() {
+            *g = canaux;
+        }
+    }
+
+    /// #6171 — les canaux de la carte posés sur cette sortie.
+    pub fn canaux_de_carte(&self) -> Option<crate::outputs::canaux_de_carte_6171::CanauxDeCarte> {
+        self.canaux_de_carte.lock().ok().and_then(|g| g.clone())
     }
 
     /// #6044 — une matrice est-elle posée sur cette sortie ?
@@ -5132,6 +5154,9 @@ impl OutputTarget for LocalOutput {
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
+        // #6171 — lus UNE fois par piste ; seul le bras ASIO s'en sert.
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
@@ -6128,6 +6153,7 @@ impl OutputTarget for LocalOutput {
                     mono_downmix,
                     reaffectation: reaffectation.clone(),
                     disposition: disposition.clone(),
+                    canaux_de_carte,
                     dop_active,
                     // #5204 — la route native consomme la réserve et enchaîne
                     // à format égal, sans refermer le pilote.

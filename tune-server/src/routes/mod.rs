@@ -8,6 +8,8 @@ pub mod appliance_storage;
 pub mod archive;
 pub mod artist_releases;
 pub mod bridge;
+/// #6171 — les canaux de la carte qu'une zone ASIO utilise.
+pub mod canaux_de_carte;
 pub mod cd_rip;
 pub mod cloud;
 pub mod cloud_error;
@@ -511,6 +513,8 @@ pub fn router_with_plugins(
         .nest("/crossfeed", crossfeed::router())
         // #6044 — réaffectation des canaux : préréglages, réglage de zone, règle d'album.
         .nest("/channel-remap", reaffectation_canaux::router())
+        // #6171 — canaux de la carte d'une zone ASIO.
+        .nest("/output-channels", canaux_de_carte::router())
         .nest("/siri", siri::router())
         .nest("/lastfm-social", lastfm_social::router())
         .nest("/stats/listening", listening_stats::router())
