@@ -337,6 +337,65 @@ pub(crate) mod tests {
         assert!(essais > 200, "la garde ne joue presque rien : {essais}");
     }
 
+    /// #6271 — collections : « finit par » était ignoré (`_ => continue`), et
+    /// un motif sur un NOMBRE passait par `LOWER(entier)`, que PostgreSQL
+    /// refuse. Le nombre se lit désormais par sa forme textuelle.
+    #[test]
+    fn collections_finit_par_et_motifs_sur_un_nombre_6271() {
+        let db = bibliotheque();
+        // Années des pistes : 1959, 1959 (album 1), 1960 (2), 2001 (3).
+        assert_eq!(
+            albums(&db, &regle("year", "contains", json!("195"))),
+            vec![1]
+        );
+        assert_eq!(
+            albums(&db, &regle("year", "not_contains", json!("195"))),
+            vec![2, 3]
+        );
+        assert_eq!(
+            albums(&db, &regle("year", "starts_with", json!("19"))),
+            vec![1, 2]
+        );
+        assert_eq!(
+            albums(&db, &regle("year", "ends_with", json!("01"))),
+            vec![3]
+        );
+        assert_eq!(
+            albums(&db, &regle("title", "ends_with", json!("STEPS"))),
+            vec![2]
+        );
+        assert_eq!(
+            albums(&db, &regle("genre", "ends_with", json!("ock"))),
+            vec![3]
+        );
+        // Les playlists, elles, le faisaient déjà : même réponse à la piste.
+        assert_eq!(
+            pistes(&db, &regle("title", "ends_with", json!("steps"))),
+            vec![3]
+        );
+        // La forme SQL : aucun `LOWER()` autour d'une colonne numérique.
+        let ctx = RefCtx::root(&EmptyResolver, Some(1));
+        for c in CRITERES.iter().filter(|c| c.famille == Famille::Nombre) {
+            let Some(nom) = c.collection else { continue };
+            if nom == "rating" {
+                continue; // note d'album : sa propre famille d'opérateurs
+            }
+            for op in ["contains", "not_contains", "starts_with", "ends_with"] {
+                let (w, _o, _l) = build_album_query(
+                    &regle(nom, op, json!("1")),
+                    "all",
+                    "title",
+                    "asc",
+                    None,
+                    &ctx,
+                );
+                assert!(w.contains("CAST("), "{nom} {op} : {w}");
+                assert!(!w.contains("LOWER(CAST"), "{nom} {op} : {w}");
+                albums(&db, &regle(nom, op, json!("1")));
+            }
+        }
+    }
+
     /// #6250 — « ne contient pas » est le complément EXACT de « contient »,
     /// dans les deux moteurs et pour CHAQUE critère texte : les deux règles se
     /// partagent la bibliothèque, sans trou ni recouvrement. Une valeur absente

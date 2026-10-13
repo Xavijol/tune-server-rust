@@ -1496,6 +1496,13 @@ name = "pg_artiste_de_l_album_6121"
 path = "tests/pg_artiste_de_l_album_6121.rs"
 required-features = ["postgres"]
 
+# #6271 — collections : « finit par » et les motifs sur une colonne
+# numérique, sur PostgreSQL.
+[[test]]
+name = "pg_motifs_collections_6271"
+path = "tests/pg_motifs_collections_6271.rs"
+required-features = ["postgres"]
+
 # #6250 — la règle « ne contient pas » (collections et playlists) sur
 # PostgreSQL : les deux aperçus par le vrai routeur.
 [[test]]
