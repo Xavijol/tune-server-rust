@@ -612,9 +612,6 @@ pub(crate) async fn edit_track(
             }
         }
     }
-    if let Some(ref v) = body.album {
-        track.album_title = Some(v.clone());
-    }
     // #2574 — même geste que pour `album_id` juste en dessous : on rattache, et
     // on rafraîchit le nom porté par la piste pour que l'écran qui la relit
     // affiche l'artiste réellement enregistré, pas l'ancien.
@@ -643,6 +640,33 @@ pub(crate) async fn edit_track(
         track.album_id = Some(aid);
         if let Ok(Some(album)) = AlbumRepo::with_backend(state.backend.clone()).get(aid) {
             track.album_title = Some(album.title);
+        }
+    }
+    // #6270 — un album donné par son TITRE, même chemin que l'artiste
+    // (#6245) : l'album de ce titre chez le même artiste, sinon un nouveau,
+    // puis son `album_id`. Ranger le titre dans `track.album_title` ne
+    // l'enregistrait pas (`tracks` n'a pas cette colonne), et la tenue figeait
+    // l'ANCIEN `album_id`. Un `album_id` envoyé l'emporte ; un titre vide ne
+    // change pas l'album.
+    let titre_album = body
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && body.album_id.is_none());
+    if let Some(titre) = titre_album {
+        match album_par_titre(&state.backend, titre, &track) {
+            Ok((album, alid, _)) => {
+                track.album_id = Some(alid);
+                track.album_title = Some(album.title);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_album_par_titre");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    format!("Album « {titre} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
         }
     }
     if let Some(ref v) = body.genre {
@@ -691,7 +715,9 @@ pub(crate) async fn edit_track(
         if nom_artiste.is_some() || body.artist_id.is_some() {
             champs.push(Champ::Artiste);
         }
-        if body.album.is_some() || body.album_id.is_some() {
+        // #6270 — tenu seulement si l'album a réellement changé : `track`
+        // porte ici le NOUVEL `album_id`.
+        if titre_album.is_some() || body.album_id.is_some() {
             champs.push(Champ::Album);
         }
         if body.album_artist.is_some() {
@@ -850,6 +876,47 @@ struct BatchSetArtist {
 ///
 /// Aucun rapprochement flou : « Art Blakey » et « Art Blakey & The Jazz
 /// Messengers » sont deux artistes, et c'est à l'utilisateur de le dire.
+/// L'album que désigne un TITRE saisi pour la piste `track` : l'album de ce
+/// titre (sans tenir compte de la casse) chez le même artiste, sinon un album
+/// créé pour lui. Rend l'album, son id, et vrai s'il vient d'être créé.
+///
+/// #6270 — l'artiste est celui de l'album ACTUEL de la piste (renommer
+/// l'album d'une piste la garde dans la discographie du même artiste), à
+/// défaut l'artiste de la piste — déjà mis à jour si l'édition le change.
+/// Sans aucun artiste, seul un album existant de ce titre est repris.
+pub(crate) fn album_par_titre(
+    backend: &Arc<dyn DbBackend>,
+    titre: &str,
+    track: &tune_core::db::models::Track,
+) -> Result<(tune_core::db::models::Album, i64, bool), String> {
+    let repo = AlbumRepo::with_backend(backend.clone());
+    let artiste_de_l_album = track
+        .album_id
+        .and_then(|a| repo.get(a).ok().flatten())
+        .and_then(|a| a.artist_id);
+    let (album, cree) = match artiste_de_l_album.or(track.artist_id) {
+        Some(aid) => match repo
+            .get_by_title_and_artist(titre, aid, None)
+            .map_err(|e| e.to_string())?
+        {
+            Some(a) => (a, false),
+            None => (
+                repo.get_or_create(titre, aid, None)
+                    .map_err(|e| e.to_string())?,
+                true,
+            ),
+        },
+        None => (
+            repo.get_by_title(titre)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "aucun artiste pour créer l'album".to_string())?,
+            false,
+        ),
+    };
+    let id = album.id.ok_or_else(|| "album has no id".to_string())?;
+    Ok((album, id, cree))
+}
+
 /// L'artiste que désigne un NOM saisi : l'artiste existant de ce nom (sans
 /// tenir compte de la casse), sinon un artiste créé. Rend l'artiste, son id,
 /// et vrai s'il vient d'être créé.
