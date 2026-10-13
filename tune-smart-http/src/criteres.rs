@@ -62,6 +62,8 @@ impl Famille {
                 "!=",
                 "contains",
                 "starts_with",
+                // #6250 — « ne contient pas » : aucun moteur ne le traduisait.
+                "not_contains",
                 "in",
                 "is_null",
                 "is_not_null",
@@ -333,6 +335,87 @@ pub(crate) mod tests {
             }
         }
         assert!(essais > 200, "la garde ne joue presque rien : {essais}");
+    }
+
+    /// #6250 — « ne contient pas » est le complément EXACT de « contient »,
+    /// dans les deux moteurs et pour CHAQUE critère texte : les deux règles se
+    /// partagent la bibliothèque, sans trou ni recouvrement. Une valeur absente
+    /// tombe du côté « ne contient pas ».
+    ///
+    /// Avant : FAUX côté playlists (rien), règle ignorée côté collections
+    /// (tout).
+    #[test]
+    fn ne_contient_pas_est_le_complement_de_contient_6250() {
+        let db = bibliotheque();
+        // Album 1 devient MIXTE (Jazz + Rock), la piste 3 perd son genre ; un
+        // seul compositeur dans la bibliothèque.
+        db.execute_batch(
+            "UPDATE tracks SET genre = 'Rock' WHERE id = 2; \
+             UPDATE tracks SET genre = NULL WHERE id = 3; \
+             UPDATE tracks SET composer = 'Bill Evans' WHERE id = 1;",
+        )
+        .unwrap();
+        let toutes_pistes = vec![1, 2, 3, 4];
+        let tous_albums = vec![1, 2, 3];
+        let mut essais = 0;
+        for c in CRITERES.iter().filter(|c| c.famille == Famille::Texte) {
+            for v in ["o", "rock", "Blue", "zz-absent"] {
+                if let Some(nom) = c.piste {
+                    let oui = pistes(&db, &regle(nom, "contains", json!(v)));
+                    let non = pistes(&db, &regle(nom, "not_contains", json!(v)));
+                    let mut union: Vec<i64> = oui.iter().chain(&non).copied().collect();
+                    union.sort();
+                    assert_eq!(union, toutes_pistes, "pistes {nom} {v} : {oui:?} / {non:?}");
+                    essais += 1;
+                }
+                if let Some(nom) = c.collection {
+                    let oui = albums(&db, &regle(nom, "contains", json!(v)));
+                    let non = albums(&db, &regle(nom, "not_contains", json!(v)));
+                    let mut union: Vec<i64> = oui.iter().chain(&non).copied().collect();
+                    union.sort();
+                    assert_eq!(union, tous_albums, "albums {nom} {v} : {oui:?} / {non:?}");
+                    essais += 1;
+                }
+            }
+        }
+        assert!(essais > 50, "la garde ne joue presque rien : {essais}");
+
+        let r = |champ: &str, v: &str| regle(champ, "not_contains", json!(v));
+        // Playlists : la piste elle-même. La piste 3, sans genre, passe.
+        assert_eq!(pistes(&db, &r("genre", "rock")), vec![1, 3]);
+        // Collections, critère de PISTE : aucune piste de l'album ne contient.
+        // Kind of Blue a une piste Rock : écarté, alors qu'une négation posée
+        // ligne à ligne l'aurait gardé grâce à sa piste Jazz.
+        assert_eq!(albums(&db, &r("genre", "rock")), vec![2]);
+        // Un album dont l'unique piste n'a pas de genre passe aussi.
+        assert_eq!(albums(&db, &r("genre", "jazz")), vec![2, 3]);
+        // Critère d'ALBUM, valeur absente : « Seul » n'a pas de label.
+        assert_eq!(albums(&db, &r("label", "col")), vec![2, 3]);
+        assert_eq!(pistes(&db, &r("label", "col")), vec![3, 4]);
+        // Insensible à la casse ET aux accents, comme « contient ».
+        assert_eq!(pistes(&db, &r("artist", "MÎLES")), vec![3, 4]);
+        assert_eq!(albums(&db, &r("artist_name", "MILES")), vec![2, 3]);
+        // Les autres graphies se lisent pareil, et la clé `operator` aussi.
+        for op in ["does_not_contain", "not_like"] {
+            assert_eq!(
+                pistes(&db, &regle("genre", op, json!("rock"))),
+                vec![1, 3],
+                "{op}"
+            );
+            assert_eq!(
+                albums(&db, &regle("genre", op, json!("rock"))),
+                vec![2],
+                "{op}"
+            );
+        }
+        let operator =
+            json!([{"field": "genre", "operator": "not_contains", "value": "rock"}]).to_string();
+        assert_eq!(pistes(&db, &operator), vec![1, 3]);
+        assert_eq!(albums(&db, &operator), vec![2]);
+        // Les jokers restent des caractères : « 100% » ne vaut pas « 100 ».
+        db.execute_batch("UPDATE albums SET label = '100 Records' WHERE id = 2;")
+            .unwrap();
+        assert_eq!(albums(&db, &r("label", "100%")), vec![1, 2, 3]);
     }
 
     /// Ce test vérifiait que la « Note » était cassée des DEUX côtés (`no such
