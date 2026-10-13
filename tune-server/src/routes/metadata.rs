@@ -584,8 +584,33 @@ pub(crate) async fn edit_track(
     if let Some(ref v) = body.title {
         track.title = v.clone();
     }
-    if let Some(ref v) = body.artist {
-        track.artist_name = Some(v.clone());
+    // #6245 — un artiste donné par son NOM passe par le chemin de
+    // `batch_set_artist` : l'artiste de ce nom, ou un nouveau, puis son
+    // `artist_id`. Ranger le nom dans `track.artist_name` ne l'enregistrait
+    // pas (`tracks` n'a pas cette colonne) ; et la tenue, posée plus bas,
+    // figeait alors l'ANCIEN `artist_id`, qu'aucun rescan ne défaisait.
+    // Un `artist_id` envoyé avec le nom l'emporte (bloc suivant). Un nom vide
+    // ne change pas l'artiste.
+    let nom_artiste = body
+        .artist
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty() && body.artist_id.is_none());
+    if let Some(nom) = nom_artiste {
+        match artiste_par_nom(&state.backend, nom) {
+            Ok((artiste, aid, _)) => {
+                track.artist_id = Some(aid);
+                track.artist_name = Some(artiste.name);
+            }
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "edit_track_artiste_par_nom");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Artiste « {nom} » impossible à enregistrer : {e}"),
+                )
+                    .into_response();
+            }
+        }
     }
     if let Some(ref v) = body.album {
         track.album_title = Some(v.clone());
@@ -661,7 +686,9 @@ pub(crate) async fn edit_track(
         if body.title.is_some() {
             champs.push(Champ::Titre);
         }
-        if body.artist.is_some() || body.artist_id.is_some() {
+        // #6245 — tenu seulement si l'artiste a réellement changé en base :
+        // `track` porte ici le NOUVEL `artist_id`, c'est lui que la tenue fige.
+        if nom_artiste.is_some() || body.artist_id.is_some() {
             champs.push(Champ::Artiste);
         }
         if body.album.is_some() || body.album_id.is_some() {
@@ -823,6 +850,32 @@ struct BatchSetArtist {
 ///
 /// Aucun rapprochement flou : « Art Blakey » et « Art Blakey & The Jazz
 /// Messengers » sont deux artistes, et c'est à l'utilisateur de le dire.
+/// L'artiste que désigne un NOM saisi : l'artiste existant de ce nom (sans
+/// tenir compte de la casse), sinon un artiste créé. Rend l'artiste, son id,
+/// et vrai s'il vient d'être créé.
+///
+/// #6245 — LE chemin d'un artiste donné par son nom, pour toutes les routes
+/// d'édition : `batch_set_artist`, `edit_track` et le tagger. `tracks` n'a
+/// pas de colonne `artist_name` ; seul `artist_id` désigne l'artiste d'une
+/// piste. Un nom rangé ailleurs est perdu en silence.
+pub(crate) fn artiste_par_nom(
+    backend: &Arc<dyn DbBackend>,
+    nom: &str,
+) -> Result<(tune_core::db::models::Artist, i64, bool), String> {
+    let artist_repo = ArtistRepo::with_backend(backend.clone());
+    let (artiste, cree) = match artist_repo.get_by_name(nom) {
+        Ok(Some(a)) => (a, false),
+        _ => (
+            artist_repo
+                .get_or_create(nom, None, None)
+                .map_err(|e| e.to_string())?,
+            true,
+        ),
+    };
+    let id = artiste.id.ok_or_else(|| "artist has no id".to_string())?;
+    Ok((artiste, id, cree))
+}
+
 async fn batch_set_artist(
     State(state): State<AppState>,
     Json(body): Json<BatchSetArtist>,
@@ -843,26 +896,11 @@ async fn batch_set_artist(
             .into_response();
     }
 
-    let artist_repo = ArtistRepo::with_backend(state.backend.clone());
-    let (artiste, cree) = match artist_repo.get_by_name(&nom) {
-        Ok(Some(a)) => (a, false),
-        _ => match artist_repo.get_or_create(&nom, None, None) {
-            Ok(a) => (a, true),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": e.to_string()})),
-                )
-                    .into_response();
-            }
-        },
-    };
-    let Some(artist_id) = artiste.id else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": "artist has no id"})),
-        )
-            .into_response();
+    let (artiste, artist_id, cree) = match artiste_par_nom(&state.backend, &nom) {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+        }
     };
 
     let mut updated = 0i64;
