@@ -101,12 +101,15 @@ async fn routeur(id: &str, session: Arc<StreamSession>) -> String {
 }
 
 /// Une session FICHIER : le WAV est écrit sur disque et servi par `serve_file`.
-async fn servir_un_fichier(id: &str, wav: &[u8]) -> String {
-    let chemin = std::env::temp_dir().join(format!("tune-6255-{id}-{}.wav", std::process::id()));
-    std::fs::write(&chemin, wav).unwrap();
+/// `scratch_file` et non un chemin composé à la main : le garde
+/// `aucune_fuite_de_temporaires` (#3030) refuse le second. Le fichier part
+/// quand le test lâche le `ScratchFile` rendu, panique comprise.
+async fn servir_un_fichier(id: &str, wav: &[u8]) -> (String, tune_core::test_scratch::ScratchFile) {
+    let fichier = tune_core::test_scratch::scratch_file(&format!("tune-6255-{id}"), ".wav");
+    std::fs::write(fichier.path(), wav).unwrap();
     let session = Arc::new(StreamSession::new(id.into(), info24(None), false, 4));
-    *session.file_path.lock().await = Some(chemin.to_string_lossy().into_owned());
-    routeur(id, session).await
+    *session.file_path.lock().await = Some(fichier.path().to_string_lossy().into_owned());
+    (routeur(id, session).await, fichier)
 }
 
 /// Une session de CONVERSION (le producteur émet l'en-tête dans le canal),
@@ -201,7 +204,7 @@ async fn fichier_servi_depuis_44_aucune_alerte() {
     let journal = Journal::default();
     let _garde = abonne(&journal);
     let wav = musique24(2.0);
-    let url = servir_un_fichier("f-44", &wav).await;
+    let (url, _fichier) = servir_un_fichier("f-44", &wav).await;
     let (_, recu) = lire(&url, 44, None).await;
     assert_eq!(recu, wav[44..], "flux intact");
     let (_, recu) = lire(&url, 0, None).await;
@@ -215,7 +218,7 @@ async fn fichier_repris_en_phase_4_leve_reprise_hors_trame_et_decodage_decale() 
     let journal = Journal::default();
     let _garde = abonne(&journal);
     let wav = musique24(2.0);
-    let url = servir_un_fichier("f-phase4", &wav).await;
+    let (url, _fichier) = servir_un_fichier("f-phase4", &wav).await;
     let n = reprise_de_phase_4();
     let (servi, recu) = lire(&url, n, None).await;
     assert_eq!(
