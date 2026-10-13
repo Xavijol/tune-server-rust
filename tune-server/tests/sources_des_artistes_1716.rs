@@ -36,13 +36,22 @@ async fn get_json(app: &Router, chemin: &str) -> Value {
     let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert_eq!(statut, StatusCode::OK, "{chemin} : {}", String::from_utf8_lossy(&octets));
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "{chemin} : {}",
+        String::from_utf8_lossy(&octets)
+    );
     serde_json::from_slice(&octets).unwrap()
 }
 
 /// `provenanceDe` du client, mot pour mot.
 fn provenance_de(item: &Value) -> String {
-    let source = item["source"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("local");
+    let source = item["source"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("local");
     if source != "upnp" {
         return source.to_string();
     }
@@ -109,7 +118,10 @@ fn poser_le_banc(etat: &AppState) {
     let h = album("Même disque", double, "upnp", Some("uuid:serveur-1|obj-h"));
     piste(h, double, "upnp", Some("uuid:serveur-1|t-h1"));
     etat.backend
-        .execute(&format!("INSERT INTO hidden_items (item_type, item_id) VALUES ('album', {f})"), &[])
+        .execute(
+            &format!("INSERT INTO hidden_items (item_type, item_id) VALUES ('album', {f})"),
+            &[],
+        )
         .unwrap();
 }
 
@@ -123,14 +135,26 @@ async fn les_sources_rendues_sont_celles_que_le_client_calculait() {
     let mut attendu: BTreeMap<i64, BTreeSet<String>> = BTreeMap::new();
     let albums = get_json(&app, "/api/v1/library/albums?limit=2000&offset=0").await;
     let pistes = get_json(&app, "/api/v1/library/tracks?limit=5000&offset=0").await;
-    for item in albums["items"].as_array().unwrap().iter().chain(pistes["items"].as_array().unwrap()) {
+    for item in albums["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(pistes["items"].as_array().unwrap())
+    {
         if let Some(id) = item["artist_id"].as_i64() {
             attendu.entry(id).or_default().insert(provenance_de(item));
         }
     }
-    assert!(attendu.values().any(|s| s.len() >= 3), "le banc doit porter un artiste à trois sources");
+    assert!(
+        attendu.values().any(|s| s.len() >= 3),
+        "le banc doit porter un artiste à trois sources"
+    );
 
-    let page = get_json(&app, "/api/v1/library/artists?limit=2000&offset=0&provenances=1").await;
+    let page = get_json(
+        &app,
+        "/api/v1/library/artists?limit=2000&offset=0&provenances=1",
+    )
+    .await;
     let items = page["items"].as_array().unwrap();
     assert!(!items.is_empty());
     for a in items {
@@ -141,11 +165,19 @@ async fn les_sources_rendues_sont_celles_que_le_client_calculait() {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(recu, attendu.get(&id).cloned().unwrap_or_default(), "artiste {} ({id})", a["name"]);
+        assert_eq!(
+            recu,
+            attendu.get(&id).cloned().unwrap_or_default(),
+            "artiste {} ({id})",
+            a["name"]
+        );
     }
     // Les comptes : « Deux Sources » a un album et une piste chez serveur-1.
     let mixte = items.iter().find(|a| a["name"] == "Deux Sources").unwrap();
-    assert_eq!(mixte["provenances"]["upnp:uuid:serveur-1"], serde_json::json!({"albums": 1, "pistes": 1}));
+    assert_eq!(
+        mixte["provenances"]["upnp:uuid:serveur-1"],
+        serde_json::json!({"albums": 1, "pistes": 1})
+    );
 }
 
 #[tokio::test]
