@@ -1025,10 +1025,22 @@ pub fn build_album_query(
         );
         let int_val = || value.parse::<i64>().unwrap_or(0);
 
+        // #6271 — un MOTIF (`LIKE`) sur la colonne. Un nombre se compare par
+        // sa forme TEXTUELLE, comme dans les playlists (#1008) : `LOWER()` d'un
+        // entier passe sur SQLite mais PostgreSQL le refuse (`function
+        // lower(integer) does not exist`) et l'aperçu tombait.
+        let motif = |m: &str| {
+            if is_text {
+                format!("LOWER({col}) LIKE LOWER('{m}'){esc_clause}")
+            } else {
+                format!("CAST({col} AS TEXT) LIKE '{m}'{esc_clause}")
+            }
+        };
+
         let cond = match op {
             "=" if is_text => format!("LOWER({col}) = LOWER('{esc}')"),
             "!=" if is_text => format!("LOWER({col}) != LOWER('{esc}')"),
-            "contains" => format!("LOWER({col}) LIKE LOWER('%{esc_like}%'){esc_clause}"),
+            "contains" => motif(&format!("%{esc_like}%")),
             // #6250 — « ne contient pas » : le complément EXACT de « contient »,
             // qui retient un album dès qu'UNE ligne (album × piste) contient.
             // Une valeur absente « ne contient pas » (`regles_sql::ne_contient_pas`).
@@ -1045,7 +1057,7 @@ pub fn build_album_query(
             // Cette règle-ci était ignorée (`_ => continue`) : la collection
             // rendait toute la bibliothèque.
             crate::regles_sql::NE_CONTIENT_PAS => {
-                let contient = format!("LOWER({col}) LIKE LOWER('%{esc_like}%'){esc_clause}");
+                let contient = motif(&format!("%{esc_like}%"));
                 if critere_d_album(field) {
                     crate::regles_sql::ne_contient_pas(col, &contient)
                 } else {
@@ -1054,7 +1066,10 @@ pub fn build_album_query(
                     )
                 }
             }
-            "starts_with" => format!("LOWER({col}) LIKE LOWER('{esc_like}%'){esc_clause}"),
+            "starts_with" => motif(&format!("{esc_like}%")),
+            // #6271 — « finit par » : les playlists le traduisaient, ici la
+            // règle tombait dans `_ => continue` et la collection rendait TOUT.
+            "ends_with" => motif(&format!("%{esc_like}")),
             "is_null" => format!("({col} IS NULL OR {col} = '')"),
             "is_not_null" => format!("({col} IS NOT NULL AND {col} != '')"),
             "=" => format!("{col} = {}", int_val()),
