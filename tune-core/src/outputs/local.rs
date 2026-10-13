@@ -3848,14 +3848,93 @@ fn prepare_windows_native_pcm(
     pure_bypass: &AtomicBool,
     mono_downmix: &AtomicBool,
 ) -> Option<PreparedNativePcm> {
+    prepare_windows_native_pcm_adaptee(
+        bytes,
+        bit_depth,
+        channels,
+        must_classify_24_bit,
+        dop_latched,
+        volume_units,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
+        None,
+    )
+}
+
+/// #6247 — l'adaptation des canaux d'un transport natif exclusif (WASAPI,
+/// ASIO natif) : la réaffectation de la zone ou de l'album (#6044), à défaut
+/// la disposition déclarée par le fichier (#6057). Le périphérique est ouvert
+/// aux canaux de la source, donc la matrice va de N à N.
+#[cfg(any(target_os = "windows", test))]
+pub(super) type AdaptationNative<'a> = (&'a CreneauReaffectation, &'a CreneauDisposition);
+
+/// La disposition déclarée déplace-t-elle une voie, à nombre de canaux égal ?
+/// Mesuré par la fonction même qui l'appliquerait (#4969) : une disposition
+/// qui recopie chaque voie à sa place ne doit pas coûter le bit-perfect.
+#[cfg(any(target_os = "windows", test))]
+fn disposition_deplace_une_voie(
+    disposition: &crate::audio::disposition_canaux::Disposition,
+    canaux: u16,
+) -> bool {
+    use crate::audio::carte_des_canaux::{CarteDesCanaux, adapter_vers_la_sortie};
+    CarteDesCanaux::depuis_adaptation(canaux, canaux, |impulsions| {
+        adapter_vers_la_sortie(impulsions, canaux, canaux, None, Some(disposition))
+    }) != Some(CarteDesCanaux::identite(canaux))
+}
+
+/// [`prepare_windows_native_pcm`], avec l'adaptation des canaux du transport
+/// natif (#6247). Sans elle (`None`), le rendu est celui d'avant, mot pour
+/// mot. Avec une matrice ou une disposition qui déplace une voie, le bloc
+/// prend la branche flottante — DSP, puis adaptation des canaux, puis volume —
+/// et n'est plus bit-perfect. Jamais sur un porteur DoP ni en PURE (la
+/// matrice), comme l'étage de conversion (`adaptation_retenue`).
+#[cfg(any(target_os = "windows", test))]
+#[allow(clippy::too_many_arguments)]
+fn prepare_windows_native_pcm_adaptee(
+    bytes: &[u8],
+    bit_depth: u16,
+    channels: u16,
+    must_classify_24_bit: bool,
+    dop_latched: bool,
+    volume_units: u32,
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
+    adaptation: Option<AdaptationNative<'_>>,
+) -> Option<PreparedNativePcm> {
     let probe_bytes = DOP_DETECT_FRAMES * channels.max(1) as usize * 3;
     if bit_depth == 24 && must_classify_24_bit && bytes.len() < probe_bytes {
         return None;
     }
 
     let dop = dop_latched || (bit_depth == 24 && is_dop_pcm(bytes, bit_depth, channels));
+    let (matrice, declaree) = match adaptation {
+        Some((reaffectation, disposition)) => {
+            let (matrice, declaree) = adaptation_retenue_pour(
+                reaffectation,
+                disposition,
+                channels,
+                channels,
+                dop,
+                pure_bypass.load(Ordering::Relaxed),
+            );
+            reaffectation.noter(matrice.is_some());
+            (
+                matrice,
+                declaree.filter(|d| disposition_deplace_une_voie(d, channels)),
+            )
+        }
+        None => (None, None),
+    };
+    let canaux_adaptes = matrice.is_some() || declaree.is_some();
     let bit_perfect = dop
         || (volume_units == 1000
+            && !canaux_adaptes
             && local_dsp_is_identity(eq, convolver, crossfeed, pure_bypass, mono_downmix));
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
@@ -3871,6 +3950,20 @@ fn prepare_windows_native_pcm(
             channels,
             false,
         );
+        if canaux_adaptes {
+            match crate::audio::carte_des_canaux::adapter_vers_la_sortie(
+                &float,
+                channels,
+                channels,
+                matrice.as_deref(),
+                declaree.as_deref(),
+            ) {
+                Ok(adapte) => float = adapte,
+                Err(error) => {
+                    warn!(channels, error = %error, "native_channel_adaptation_rejected");
+                }
+            }
+        }
         let volume = volume_units as f32 / 1000.0;
         if volume != 1.0 {
             for sample in &mut float {
@@ -4396,8 +4489,28 @@ fn adaptation_retenue(
     dop_active: &AtomicBool,
     pure_bypass: &AtomicBool,
 ) -> AdaptationRetenue {
-    let dop = dop_active.load(Ordering::Relaxed);
-    let matrice = if dop || pure_bypass.load(Ordering::Relaxed) {
+    adaptation_retenue_pour(
+        reaffectation,
+        disposition,
+        source,
+        sortie,
+        dop_active.load(Ordering::Relaxed),
+        pure_bypass.load(Ordering::Relaxed),
+    )
+}
+
+/// [`adaptation_retenue`] sur des états déjà lus : le transport natif décide
+/// le DoP bloc par bloc (`prepare_windows_native_pcm_adaptee`), avant que
+/// `dop_active` ne le publie.
+fn adaptation_retenue_pour(
+    reaffectation: &CreneauReaffectation,
+    disposition: &CreneauDisposition,
+    source: u16,
+    sortie: u16,
+    dop: bool,
+    pure: bool,
+) -> AdaptationRetenue {
+    let matrice = if dop || pure {
         None
     } else {
         reaffectation.pour(source, sortie)
@@ -6203,6 +6316,8 @@ impl OutputTarget for LocalOutput {
                     crossfeed,
                     pure_bypass,
                     mono_downmix,
+                    reaffectation: reaffectation.clone(),
+                    disposition: disposition.clone(),
                     dop_active,
                     // #5204 — le bras consomme la réserve et enchaîne à
                     // format égal, sans refermer le flux.
