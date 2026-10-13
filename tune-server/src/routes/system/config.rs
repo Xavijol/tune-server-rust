@@ -1637,6 +1637,22 @@ pub(super) async fn update_config(
     if let Some(p) = politique_de_lecture {
         tune_core::taches_de_fond::priorite::politique::regler(p);
     }
+    // #6255 — le détecteur de bruit des lecteurs réseau vaut pour les
+    // connexions qui s'ouvrent ensuite, sans redémarrage.
+    if cles_posees
+        .iter()
+        .any(|c| c == tune_core::http::bruit_reseau::CLE_REGLAGE)
+    {
+        let actif = tune_core::http::bruit_reseau::resoudre(
+            settings
+                .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+                .ok()
+                .flatten()
+                .as_deref(),
+        );
+        tune_core::http::bruit_reseau::regler(actif);
+        tracing::info!(actif, "network_noise_watch_applied");
+    }
     // #3809 — appliquer MAINTENANT, pas au prochain démarrage.
     let annonce_appliquee = annonce_demandee.map(|a| appliquer_annonce_slimproto(a, state.port));
     // Fil 2148 (#5792) — le délai des partages réseau vaut dès l'attente en

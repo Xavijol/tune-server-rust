@@ -11,6 +11,9 @@ use tracing::{debug, info, warn};
 
 // #6130 — journal de contexte et détecteur de bruit de la voie conversion.
 mod bruit_suspect_6130;
+// #6255 — le bruit suspect vu depuis un lecteur réseau (reprise hors trame,
+// décodage décalé, en-tête au milieu).
+mod bruit_suspect_reseau;
 
 use tune_core::http::streamer::{
     ICY_METAINT, ReresolveFn, SharedSessions, StreamInfo, StreamSession, build_icy_metadata,
@@ -866,6 +869,22 @@ pub async fn handle_stream(
             is_wav && !has_icy,
         )),
     });
+    // #6255 — posée par le corps quand la reprise quitte la retenue.
+    let jonction = bruit_suspect_reseau::Jonction::default();
+    let jonction_du_corps = jonction.clone();
+    let observateur_reseau = (is_wav && wav_header_included && !has_icy)
+        .then(|| {
+            bruit_suspect_reseau::ObservateurReseau::nouveau(
+                &session,
+                "conversion",
+                user_agent.as_deref().unwrap_or("-"),
+                range_hdr,
+                reprise_exacte.unwrap_or_else(|| range_demande.filter(|s| *s >= 44).unwrap_or(0)),
+                bruit_suspect_reseau::EN_TETE_CANONIQUE,
+                Some(jonction),
+            )
+        })
+        .flatten();
     let data_ready = session.data_ready.clone();
     // Les six `yield` de cette branche — en-tete WAV, blocs ICY, morceaux de
     // radio, deux vidages de tampon — sont comptes par `corps_compte`.
@@ -1272,6 +1291,7 @@ pub async fn handle_stream(
                                 "reprise_hors_retenue — la fenêtre a glissé pendant la reprise (#5426)"
                             );
                             reprise = None;
+                            jonction_du_corps.signaler();
                             if trame_de_sortie > 1 {
                                 a_remettre_en_phase = Some(position);
                             }
@@ -1459,6 +1479,7 @@ pub async fn handle_stream(
         }
         morceau
     });
+    let flux = bruit_suspect_reseau::sur_le_flux(flux, observateur_reseau);
     let body = corps_compte(flux, compteur);
 
     let status = if use_partial {
@@ -1817,6 +1838,8 @@ async fn serve_file(
                 ),
             ),
         };
+        let body =
+            bruit_suspect_reseau::sur_le_fichier(body, path, &session, req_headers, start).await;
         return (StatusCode::PARTIAL_CONTENT, headers, body).into_response();
     }
 
@@ -1854,6 +1877,7 @@ async fn serve_file(
             ),
         ),
     };
+    let body = bruit_suspect_reseau::sur_le_fichier(body, path, &session, req_headers, 0).await;
     (StatusCode::OK, headers, body).into_response()
 }
 
@@ -5451,6 +5475,9 @@ mod bruit_trois_connexions_b209bruit;
 
 #[cfg(test)]
 mod bruit_suspect_de_bout_en_bout_6130;
+
+#[cfg(test)]
+mod bruit_suspect_reseau_de_bout_en_bout_6255;
 
 /// #6221 — un fichier virtuel (DSF fabriqué depuis un DST) servi avec le
 /// contrat fichier : Content-Length, Range, 416.

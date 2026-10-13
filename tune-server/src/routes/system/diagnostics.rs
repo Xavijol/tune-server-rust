@@ -973,6 +973,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // pas leur zone. Le journal porte `dsp_ecretage` au premier écrêtage
         // d'une piste et à sa fin.
         "dsp_ecretage": tune_core::audio::ecretage::releve(),
+        // #6255 — les derniers `bruit_suspect_reseau` : ce que le serveur a
+        // envoyé à un lecteur réseau et qui s'entendra comme du bruit.
+        "bruit_suspect_reseau": tune_core::http::bruit_reseau::derniers(),
+        "bruit_suspect_reseau_actif": tune_core::http::bruit_reseau::actif(),
         // #2201 — le garde anti-crash ASIO ne doit plus vivre uniquement dans
         // une ligne WARN que l'utilisateur ne verra jamais.
         "asio_warm_scan": crate::startup::asio_warm_status(),
@@ -2589,6 +2593,21 @@ confondre avec la famine de l'anneau, comptee au-dessus)\n\n",
 journal porte `dsp_ecretage` au premier ecretage d'une piste et a sa fin, \
 jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     );
+    // #6255 — ce que le serveur a ENVOYÉ aux lecteurs réseau et qui
+    // s'entendra comme du bruit (reprise hors trame, décodage décalé, en-tête
+    // au milieu). Le lecteur ne le dit jamais : sans cette section, le bruit
+    // blanc du .18 du 13/10 ne laissait rien dans le rapport.
+    let bruit_reseau = tune_core::http::bruit_reseau::derniers();
+    md.push_str(&tune_core::http::bruit_reseau::section_du_rapport(
+        &bruit_reseau,
+        |id| {
+            zones
+                .iter()
+                .find(|z| z["id"].as_i64() == Some(id))
+                .and_then(|z| z["name"].as_str())
+                .map(str::to_string)
+        },
+    ));
     md.push_str("## Database\n");
     // #3182 : c'était `format!("- Engine: sqlite\n")` — un `format!` sans
     // argument, donc une chaîne littérale, et toute installation PostgreSQL
@@ -2729,6 +2748,8 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
         "dsp_ecretage": dsp_ecretage,
+        // Le pendant JSON de la section « Lecteurs reseau — bruit suspect ».
+        "bruit_suspect_reseau": bruit_reseau,
         "database": {
             // #3182 : même mensonge que la ligne markdown ci-dessus, dans le
             // corps JSON que le client lit.
