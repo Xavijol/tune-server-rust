@@ -1477,6 +1477,13 @@ name = "pg_artiste_de_l_album_6121"
 path = "tests/pg_artiste_de_l_album_6121.rs"
 required-features = ["postgres"]
 
+# #6250 — la règle « ne contient pas » (collections et playlists) sur
+# PostgreSQL : les deux aperçus par le vrai routeur.
+[[test]]
+name = "pg_ne_contient_pas_6250"
+path = "tests/pg_ne_contient_pas_6250.rs"
+required-features = ["postgres"]
+
 # #6122 — la règle « dans les N derniers jours » (date d'ajout, dernière
 # écoute) sur PostgreSQL : les deux aperçus par le vrai routeur.
 [[test]]
