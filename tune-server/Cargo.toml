@@ -1477,6 +1477,12 @@ required-features = ["postgres"]
 name = "artiste_par_nom_6245"
 path = "tests/artiste_par_nom_6245.rs"
 
+# #6270 — l'album d'une piste modifié par son TITRE (édition, tagger) :
+# enregistré par `album_id`, tenu à la NOUVELLE valeur, gardé au rescan.
+[[test]]
+name = "album_par_titre_6270"
+path = "tests/album_par_titre_6270.rs"
+
 # #2574 — `tests/piste_artiste_par_id.rs` existait sans cible : jamais
 # compilé (`autotests = false`). Rattaché avec #6245, son voisin direct.
 [[test]]

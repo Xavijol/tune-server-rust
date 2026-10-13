@@ -201,14 +201,31 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
             )
             .map_err(AppError::internal)?;
     }
-    if let Some(album) = &fields.album {
+    // #6270 — même défaut que l'artiste : `album_title` n'est pas une colonne
+    // de `tracks`. Le titre passe par `metadata::album_par_titre` (l'album de
+    // ce titre chez le même artiste, sinon un nouveau), puis `album_id`. Lu
+    // APRÈS l'artiste : un album créé l'est pour le nouvel artiste si la
+    // piste n'avait pas d'album.
+    let titre_album = fields
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty());
+    if let Some(titre) = titre_album {
+        let piste = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+            .get(track_id)
+            .map_err(AppError::internal)?
+            .ok_or_else(|| AppError::internal("piste disparue"))?;
+        let (_, album_id, _) =
+            crate::routes::metadata::album_par_titre(&state.backend, titre, &piste)
+                .map_err(AppError::internal)?;
         state
             .backend
             .execute(
-                "UPDATE tracks SET album_title = $1 WHERE id = $2",
-                &[album as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
+                "UPDATE tracks SET album_id = $1 WHERE id = $2",
+                &[&album_id as &dyn ToSqlValue, &track_id as &dyn ToSqlValue],
             )
-            .ok();
+            .map_err(AppError::internal)?;
     }
     if let Some(genre) = &fields.genre {
         state
@@ -240,7 +257,8 @@ fn update_track_db(state: &AppState, track_id: i64, fields: &BatchFields) -> Res
         if nom_artiste.is_some() {
             champs.push(Champ::Artiste);
         }
-        if fields.album.is_some() {
+        // #6270 — tenu après l'UPDATE : fige le NOUVEL `album_id`.
+        if titre_album.is_some() {
             champs.push(Champ::Album);
         }
         if fields.genre.is_some() {
