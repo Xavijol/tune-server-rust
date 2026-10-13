@@ -26,7 +26,8 @@ use super::ArtistRepo;
 use crate::TuneError;
 use crate::db::engine::Engine;
 use crate::db::facet_filter::{
-    album_distant_double_exclu, hidden_albums_excluded, socle_de_la_vue_des_pistes,
+    album_distant_double_exclu, hidden_albums_excluded, hidden_tracks_excluded,
+    sql_pistes_ecartees_par_le_socle,
 };
 use crate::db::track_repo::expression_provenance_de;
 
@@ -54,13 +55,21 @@ pub(super) fn sql_albums(engine: Engine, ids: &str) -> String {
 }
 
 /// Les pistes du socle de la vue, par artiste de PISTE et par provenance.
+///
+/// Le socle est celui de `GET /library/tracks`, mais RÉSOLU une fois
+/// ([`sql_pistes_ecartees_par_le_socle`], #5977) : posés tels quels, ses deux
+/// replis corrélés se rejouaient sur chaque piste des artistes de la page.
+/// Les deux formes écartent exactement les mêmes pistes (épreuve dans
+/// `lenteur_pistes_5138_tests`).
 pub(super) fn sql_pistes(engine: Engine, ids: &str) -> String {
     format!(
         "SELECT t.artist_id, {prov}, COUNT(*) FROM tracks t \
-         WHERE t.artist_id IN ({ids}) AND {socle} \
+         WHERE t.artist_id IN ({ids}) AND {masques} \
+         AND t.id NOT IN ({ecartees}) \
          GROUP BY 1, 2",
         prov = expression_provenance_de(engine, "t"),
-        socle = socle_de_la_vue_des_pistes(engine).join(" AND "),
+        masques = hidden_tracks_excluded(),
+        ecartees = sql_pistes_ecartees_par_le_socle(engine),
     )
 }
 
