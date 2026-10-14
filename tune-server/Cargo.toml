@@ -296,6 +296,13 @@ path = "tests/pistes_bibliotheque_lentes_5138.rs"
 name = "titres_pagines_serveur_1716"
 path = "tests/titres_pagines_serveur_1716.rs"
 
+# tune-web-client#1716, étape 2 — les sources de chaque artiste rendues par
+# `GET /library/artists?provenances=1`. `autotests = false` plus haut : sans
+# cette cible, jamais compilé.
+[[test]]
+name = "sources_des_artistes_1716"
+path = "tests/sources_des_artistes_1716.rs"
+
 # #5438 — un clic sur une collection intelligente ne coupe pas le flux : le
 # vrai routeur sur une vraie socket, 58 359 pistes, 4 fils d'exécuteur.
 # `autotests = false` : sans cette cible, jamais compilé.

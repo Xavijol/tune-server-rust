@@ -190,18 +190,25 @@ const ORDRE_PAR_DEFAUT: &str = "LOWER(ar.name), LOWER(al.title), \
 /// sinon                                    → 'upnp'
 /// ```
 pub fn expression_provenance(engine: Engine) -> String {
+    expression_provenance_de(engine, "t")
+}
+
+/// [`expression_provenance`] sur l'alias `alias` — `a` pour une ligne
+/// d'`albums`, qui porte les mêmes `source` / `source_id` (web#1716 : les
+/// sources d'un artiste réunissent ses albums et ses pistes).
+pub fn expression_provenance_de(engine: Engine, alias: &str) -> String {
     let pos = match engine {
-        Engine::Sqlite => "instr(t.source_id, '|')",
-        Engine::Postgres => "strpos(t.source_id, '|')",
+        Engine::Sqlite => format!("instr({alias}.source_id, '|')"),
+        Engine::Postgres => format!("strpos({alias}.source_id, '|')"),
     };
+    let src = format!("COALESCE(NULLIF(TRIM({alias}.source), ''), 'local')");
     format!(
         "(CASE WHEN {src} = 'upnp' \
            AND {pos} > 1 \
-           AND TRIM(substr(t.source_id, 1, {pos} - 1)) <> '' \
-           AND substr(t.source_id, {pos} + 1, 1) NOT IN ('', '|') \
-         THEN 'upnp:' || TRIM(substr(t.source_id, 1, {pos} - 1)) \
+           AND TRIM(substr({alias}.source_id, 1, {pos} - 1)) <> '' \
+           AND substr({alias}.source_id, {pos} + 1, 1) NOT IN ('', '|') \
+         THEN 'upnp:' || TRIM(substr({alias}.source_id, 1, {pos} - 1)) \
          ELSE {src} END)",
-        src = SOURCE_NORMALISEE,
     )
 }
 
