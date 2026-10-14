@@ -5605,6 +5605,7 @@ mod politique_de_lecture_4681_tests {
     /// base, et `GET /config` la publie en objet ; le démarrage la relit.
     #[tokio::test]
     async fn la_politique_s_ecrit_s_applique_et_se_relit() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let c = get_config(
             HeaderMap::new(),
