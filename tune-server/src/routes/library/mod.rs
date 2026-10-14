@@ -817,3 +817,7 @@ mod routage_tests {
 #[cfg(test)]
 #[path = "banc_rail_5993.rs"]
 mod banc_rail_5993;
+
+#[cfg(test)]
+#[path = "banc_repertoires_5998.rs"]
+mod banc_repertoires_5998;
