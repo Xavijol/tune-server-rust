@@ -156,6 +156,12 @@ pub fn router() -> Router<AppState> {
             "/background-tasks/resume-all",
             post(taches_de_fond::tout_reprendre),
         )
+        // #6330 — « Tout relancer » : tout reprendre ET rendre à la cascade
+        // les pistes en échec (ReplayGain, plage dynamique).
+        .route(
+            "/background-tasks/relaunch-all",
+            post(taches_de_fond::tout_relancer),
+        )
         .route(
             "/background-tasks/{id}/pause",
             post(taches_de_fond::pause_tache),
