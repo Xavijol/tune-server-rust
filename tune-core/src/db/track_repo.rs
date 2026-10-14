@@ -586,7 +586,7 @@ mod like_escape_tests {
 mod page_de_pistes;
 pub use page_de_pistes::{
     COLONNES_TRIABLES, ColonneDeTri, ComptesParProvenance, DemandeDePistes, PageDePistes,
-    expression_provenance,
+    expression_provenance, expression_provenance_de,
 };
 
 pub mod sql {
