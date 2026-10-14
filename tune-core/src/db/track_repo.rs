@@ -119,6 +119,71 @@ pub fn like_escape_clause() -> &'static str {
 /// (#4625), qui ne voyait que la première forme.
 pub const CHEMIN_DE_LA_PISTE: &str = "COALESCE(file_path, cue_media_path)";
 
+/// #5998 — l'index qui rend la vue Répertoires indépendante de la taille de la
+/// bibliothèque : il porte [`CHEMIN_DE_LA_PISTE`] MOT POUR MOT, parce que
+/// SQLite et PostgreSQL ne choisissent un index d'expression que si la requête
+/// écrit la même expression.
+///
+/// # Pourquoi il fallait un index de plus
+///
+/// Les deux lectures de `GET /library/browse/dir` filtraient par
+/// `COALESCE(file_path, cue_media_path) LIKE '<dossier>/%' ESCAPE '\'`. Aucun
+/// moteur ne sait servir ce `LIKE` par un index : l'expression n'est pas une
+/// colonne, la clause `ESCAPE` désactive l'optimisation de SQLite, et le motif
+/// est un paramètre pour PostgreSQL. Chaque ouverture d'un dossier de 14 pistes
+/// lisait donc DEUX fois toute la table — 553 501 pistes chez Tades (fil 2185).
+///
+/// Le filtre ajouté par [`plage_du_dossier`] est une PLAGE sur cette
+/// expression, `[<dossier>/ ; <dossier>0)`, que les deux moteurs servent par
+/// cet index. Le `LIKE` reste derrière elle, inchangé : il est l'autorité, la
+/// plage ne fait que lui épargner les lignes hors du dossier.
+///
+/// # La collation, qui fait l'équivalence
+///
+/// * SQLite : `LIKE` y est insensible à la casse ASCII, une plage binaire
+///   perdrait donc `p/Sub/x` pour un motif `p/sub/%`. En `COLLATE NOCASE`, la
+///   comparaison replie les mêmes 26 lettres que `LIKE`, et la plage contient
+///   exactement tout ce que le `LIKE` accepte.
+/// * PostgreSQL : `LIKE` y compare des octets, mais une plage dans la collation
+///   de la base (`fr_FR.UTF-8`, ICU…) suit un ordre linguistique, qui ne
+///   garantit pas que tous les chemins `<dossier>/…` tombent entre les deux
+///   bornes (la ponctuation et la casse y pèsent autrement). D'où
+///   `COLLATE "C"`, l'ordre des octets, dans l'index ET dans la requête.
+///
+/// Posé à chaque démarrage (`IF NOT EXISTS`), hors migration numérotée, comme
+/// `TRACKS_SOURCE_ID_INDEX` : le lanceur ne joue que `version > MAX`, et la
+/// 126 / PG 090 attend encore sa fusion ailleurs.
+pub const INDEX_CHEMIN_DOSSIER_SQLITE: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_chemin_dossier \
+     ON tracks(COALESCE(file_path, cue_media_path) COLLATE NOCASE)";
+
+/// Jumelle PostgreSQL de [`INDEX_CHEMIN_DOSSIER_SQLITE`] — voir sa note.
+pub const INDEX_CHEMIN_DOSSIER_PG: &str = "CREATE INDEX IF NOT EXISTS idx_tracks_chemin_dossier \
+     ON tracks ((COALESCE(file_path, cue_media_path)) COLLATE \"C\")";
+
+/// Les bornes `[bas ; haut)` de tous les chemins qui commencent par
+/// `<dossier><séparateur>` : `bas` est ce préfixe, `haut` le même dont le
+/// séparateur final est remplacé par le caractère suivant (`/` → `0`,
+/// `\` → `]`). Même repli que [`folder_like_pattern`] : séparateurs finaux
+/// retirés, NFC.
+pub fn bornes_du_dossier(dossier: &str) -> (String, String) {
+    use unicode_normalization::UnicodeNormalization as _;
+    let sep = std::path::MAIN_SEPARATOR;
+    let base: String = dossier.trim_end_matches(['/', '\\']).nfc().collect();
+    let suivant = char::from(sep as u8 + 1);
+    (format!("{base}{sep}"), format!("{base}{suivant}"))
+}
+
+/// Le filtre de plage de [`INDEX_CHEMIN_DOSSIER_SQLITE`] sur `expr` (qui doit
+/// être [`CHEMIN_DE_LA_PISTE`], qualifiée ou non), entre les paramètres
+/// `p_bas` et `p_haut` liés aux valeurs de [`bornes_du_dossier`].
+pub fn plage_du_dossier(engine: Engine, expr: &str, p_bas: &str, p_haut: &str) -> String {
+    let collation = match engine {
+        Engine::Postgres => "\"C\"",
+        Engine::Sqlite => "NOCASE",
+    };
+    format!("{expr} COLLATE {collation} >= {p_bas} AND {expr} COLLATE {collation} < {p_haut}")
+}
+
 /// Les comptes rendus par [`compter_pistes_par_sous_dossier`], indexés par nom
 /// de sous-dossier.
 ///
@@ -155,6 +220,64 @@ impl ComptesParSousDossier {
     pub fn nb_dossiers_peuples(&self) -> usize {
         self.comptes.len()
     }
+}
+
+/// Le texte SQL des pistes posées directement dans un dossier, lu par
+/// `GET /library/browse/dir` (vue Répertoires). Mêmes paramètres, dans le même
+/// ordre, que [`sql_compter_pistes_par_sous_dossier`] ; `depart_enfant` est le
+/// premier caractère (1-indexé) après `<dossier><séparateur>`.
+///
+/// Le `LIKE` est RÉCURSIF et le `strpos`/`instr` qui le suit écarte les pistes
+/// des sous-dossiers (#3857) ; la plage de [`plage_du_dossier`] passe devant
+/// les deux pour que le moteur parte de l'index (#5998). La colonne 16 porte
+/// [`CHEMIN_DE_LA_PISTE`] pour le filtre « enfant direct » de la route (#4625).
+pub fn sql_pistes_du_dossier(engine: Engine, depart_enfant: usize) -> String {
+    let (ph, ph2, ph3, ph4, pos) = match engine {
+        Engine::Postgres => ("$1", "$2", "$3", "$4", "strpos"),
+        Engine::Sqlite => ("?1", "?2", "?3", "?4", "instr"),
+    };
+    let plage = plage_du_dossier(engine, "COALESCE(t.file_path, t.cue_media_path)", ph3, ph4);
+    format!(
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
+               t.disc_number, t.track_number, t.duration_ms, t.file_path, \
+               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
+               COALESCE(t.file_path, t.cue_media_path) \
+               FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+               LEFT JOIN artists ar ON t.artist_id = ar.id \
+               WHERE {plage} \
+               AND COALESCE(t.file_path, t.cue_media_path) LIKE {ph}{esc} \
+               AND {pos}(substr(COALESCE(t.file_path, t.cue_media_path), {depart_enfant}), {ph2}) = 0 \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        esc = like_escape_clause()
+    )
+}
+
+/// Le texte SQL de [`compter_pistes_par_sous_dossier`]. Paramètres, dans
+/// l'ordre : le motif de [`folder_like_pattern`], le séparateur, puis les deux
+/// bornes de [`bornes_du_dossier`]. Public pour que les tests lisent le plan
+/// de la requête même que la route exécute (#5998).
+pub fn sql_compter_pistes_par_sous_dossier(engine: Engine, depart: usize) -> String {
+    let (p1, p2, p3, p4, pos) = match engine {
+        Engine::Postgres => ("$1", "$2", "$3", "$4", "strpos"),
+        Engine::Sqlite => ("?1", "?2", "?3", "?4", "instr"),
+    };
+    // #5998 — la plage indexée précède le `LIKE` : sans elle, compter les
+    // sous-dossiers d'un dossier de 14 pistes relisait toute la table.
+    let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, p3, p4);
+    // 🔴 #4625 — `COALESCE(file_path, cue_media_path)` et non `file_path`
+    // seul : une piste découpée par une feuille CUE a `file_path = NULL` par
+    // construction (elle vit dans `cue_media_path`, voir
+    // `scanner::cue_bibliotheque`), et le scan RETIRE de la bibliothèque les
+    // fichiers que la feuille découpe. Un dossier rangé en CUE — y compris une
+    // feuille « un FILE par piste » posée à côté de FLAC ordinaires — tombait
+    // donc à 0 dans la vue par dossiers, alors que ses pistes sont en base.
+    format!(
+        "SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS segment, COUNT(*) \
+         FROM (SELECT substr({CHEMIN_DE_LA_PISTE}, {depart}) AS reste FROM tracks \
+         WHERE {plage} AND {CHEMIN_DE_LA_PISTE} LIKE {p1}{esc}) AS sous \
+         WHERE {pos}(reste, {p2}) > 0 GROUP BY segment",
+        esc = like_escape_clause()
+    )
 }
 
 /// Le nombre de pistes sous **chaque sous-dossier direct** de `parent`, en
@@ -208,26 +331,9 @@ pub fn compter_pistes_par_sous_dossier(
     let depart = base.chars().count() + sep.chars().count() + 1;
     let motif = folder_like_pattern(parent);
     let postgres = backend.engine() == Engine::Postgres;
-    let (p1, p2, pos) = if postgres {
-        ("$1", "$2", "strpos")
-    } else {
-        ("?1", "?2", "instr")
-    };
-    // 🔴 #4625 — `COALESCE(file_path, cue_media_path)` et non `file_path`
-    // seul : une piste découpée par une feuille CUE a `file_path = NULL` par
-    // construction (elle vit dans `cue_media_path`, voir
-    // `scanner::cue_bibliotheque`), et le scan RETIRE de la bibliothèque les
-    // fichiers que la feuille découpe. Un dossier rangé en CUE — y compris une
-    // feuille « un FILE par piste » posée à côté de FLAC ordinaires — tombait
-    // donc à 0 dans la vue par dossiers, alors que ses pistes sont en base.
-    let sql = format!(
-        "SELECT substr(reste, 1, {pos}(reste, {p2}) - 1) AS segment, COUNT(*) \
-         FROM (SELECT substr({CHEMIN_DE_LA_PISTE}, {depart}) AS reste FROM tracks \
-         WHERE {CHEMIN_DE_LA_PISTE} LIKE {p1}{esc}) AS sous \
-         WHERE {pos}(reste, {p2}) > 0 GROUP BY segment",
-        esc = like_escape_clause()
-    );
-    let params: [&dyn ToSqlValue; 2] = [&motif, &sep];
+    let sql = sql_compter_pistes_par_sous_dossier(backend.engine(), depart);
+    let (bas, haut) = bornes_du_dossier(parent);
+    let params: [&dyn ToSqlValue; 4] = [&motif, &sep, &bas, &haut];
     let rows = backend.query_many(&sql, &params)?;
     let mut comptes: HashMap<String, i64> = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -7054,3 +7160,7 @@ mod tests_facettes_en_et_2108 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "track_repo_repertoires_5998_tests.rs"]
+mod repertoires_5998_tests;

@@ -183,6 +183,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5997 -- --nocapture --test-threads=1
 
+      # #5998 — vue Répertoires : les deux requêtes partent de l'index du
+      # chemin et rendent les mêmes lignes. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Répertoires par l'index du chemin sur PostgreSQL (#5998)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
+
       - name: Sources des alarmes sur PostgreSQL (#3715)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test

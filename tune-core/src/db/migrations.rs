@@ -4422,6 +4422,10 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
         warn!(error = %e, "sqlite_upnp_numeros_zero_a_null_failed");
     }
+    // #5998 — vue Répertoires : même passe — voir la constante.
+    if let Err(e) = db.execute_batch(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_SQLITE) {
+        warn!(error = %e, "sqlite_tracks_chemin_dossier_index_failed");
+    }
 
     db.execute_batch(include_str!("../../migrations/upnp_library_sync.sql"))?;
     db.execute_batch(include_str!("../../migrations/upnp_catalog_revision.sql"))?;
@@ -5409,6 +5413,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
     // b209 — même passe que la passe finale SQLite.
     if let Err(e) = sqlx::raw_sql(UPNP_NUMEROS_ZERO_A_NULL).execute(pool).await {
         warn!(error = %e, "pg_upnp_numeros_zero_a_null_failed");
+    }
+    // #5998 — même passe que la passe finale SQLite, même raison.
+    if let Err(e) = sqlx::raw_sql(crate::db::track_repo::INDEX_CHEMIN_DOSSIER_PG)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_tracks_chemin_dossier_index_failed");
     }
 
     // #4836 (suite) — même passe que `combler_les_labels_d_album_sqlite`,
