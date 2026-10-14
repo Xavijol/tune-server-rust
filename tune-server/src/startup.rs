@@ -509,9 +509,7 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
     }
     deduplicate_radios(state);
     restore_zone_volumes(state).await;
-    restore_playback_positions(state).await;
-    restore_queues(state, config);
-    restore_queue_metadata(state, config).await;
+    restaurer_la_lecture(state, config).await;
     restore_oaat_groups(state).await;
     persist_initial_settings(state, config);
     resolve_ytdlp(state).await;
@@ -1337,6 +1335,155 @@ async fn restore_playback_positions(state: &AppState) {
                 "playback_position_restored"
             );
         }
+    }
+}
+
+/// La lecture de chaque zone telle que l'arrêt du serveur l'a laissée : piste
+/// en cours, position, file. Une seule fonction pour que les tests passent par
+/// le même enchaînement que `init_state` (#6380).
+async fn restaurer_la_lecture(state: &AppState, config: &TuneConfig) {
+    restore_playback_positions(state).await;
+    restore_queues(state, config);
+    restore_queue_metadata(state, config).await;
+    // #6380 — APRÈS la file : la piste de service se retrouve dans les lignes
+    // que `restore_queues` vient d'assurer, et sa position dans la file
+    // remplace celle de l'instantané.
+    restore_service_track_positions(state).await;
+}
+
+/// #6380 — la piste en cours d'une zone quand elle vient d'un SERVICE.
+///
+/// Sandro, fil 2284 : album Qobuz en file, serveur redémarré, et l'interface
+/// annonce « Aucune lecture en cours » alors que les 5 lignes de la file sont
+/// en base. `restore_playback_positions` ne sait rendre qu'une piste de
+/// BIBLIOTHÈQUE (`last_track_id`) ; une piste Qobuz, Tidal, Deezer… n'a que
+/// `last_track_source` + `last_track_source_id`, et elle était ignorée.
+///
+/// La fiche vient de la ligne de file qui porte ce `source_id` : titre,
+/// artiste, album, pochette, durée y sont déjà. Aucun appel au service ici —
+/// le démarrage ne doit pas attendre Qobuz, et un service déconnecté ne doit
+/// pas faire disparaître la piste : son erreur viendra à la lecture.
+///
+/// Même état que pour une piste locale (`PlaybackManager::restore_position`) :
+/// zone arrêtée, piste et position tenues, reprise armée. Rien ne joue. Un
+/// `Paused` serait faux ici : « Reprendre » enverrait `resume` à un renderer
+/// qui n'a rien chargé, alors que l'état arrêté passe par le chemin « Lecture
+/// après arrêt », qui relance la piste à `pending_resume_ms`.
+///
+/// La piste absente de la file (file vidée, ou ligne retirée) n'est pas
+/// restaurée : sans la ligne, on n'a rien d'honnête à afficher sans appeler
+/// le service.
+async fn restore_service_track_positions(state: &AppState) {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let queue_repo =
+        tune_core::db::play_queue_repo::PlayQueueRepo::with_backend(state.backend.clone());
+    let Ok(zones) = zone_repo.list() else { return };
+    for zone in &zones {
+        let Some(zone_id) = zone.id else { continue };
+        // Le chemin local (et la radio) reste à `restore_playback_positions`.
+        if zone.last_track_id.is_some() {
+            continue;
+        }
+        let Some(source) = zone.last_track_source.as_deref() else {
+            continue;
+        };
+        if matches!(source, "local" | "radio" | "") {
+            continue;
+        }
+        let Some(source_id) = zone
+            .last_track_source_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let actuel = state.playback.get_state(zone_id).await;
+        if actuel.now_playing.is_some() {
+            continue;
+        }
+        let entries = queue_repo.get_ordered(zone_id).unwrap_or_default();
+        let Some(entry) =
+            ligne_de_la_piste_de_service(&entries, source, source_id, actuel.queue_position)
+        else {
+            info!(
+                zone_id,
+                zone_name = %zone.name,
+                source,
+                queue_len = entries.len(),
+                "playback_position_not_restored_service_track_not_in_queue"
+            );
+            continue;
+        };
+        let np = now_playing_de_la_ligne_de_service(entry, source);
+        let clamped_pos = if np.duration_ms > 0 {
+            zone.last_position_ms
+                .min(np.duration_ms.saturating_sub(1000))
+        } else {
+            zone.last_position_ms
+        };
+        let dur = np.duration_ms;
+        // La position dans la file : celle de la ligne, pour que la piste
+        // suivante soit la bonne à la fin de celle-ci.
+        state
+            .playback
+            .update_queue_info(zone_id, entry.position, entries.len() as i64)
+            .await;
+        state
+            .playback
+            .restore_position(zone_id, clamped_pos.max(0), np)
+            .await;
+        info!(
+            zone_id,
+            zone_name = %zone.name,
+            position_ms = clamped_pos,
+            original_ms = zone.last_position_ms,
+            duration_ms = dur,
+            source,
+            queue_position = entry.position,
+            "playback_position_restored"
+        );
+    }
+}
+
+/// La ligne de file qui porte la piste de service enregistrée. Une piste peut
+/// figurer deux fois : la ligne courante d'abord, puis celle à la position de
+/// file restaurée, puis la première.
+fn ligne_de_la_piste_de_service<'a>(
+    entries: &'a [tune_core::db::play_queue_repo::QueueEntry],
+    source: &str,
+    source_id: &str,
+    position_restauree: i64,
+) -> Option<&'a tune_core::db::play_queue_repo::QueueEntry> {
+    let candidates: Vec<_> = entries
+        .iter()
+        .filter(|e| {
+            e.track_id.is_none()
+                && e.source_id.as_deref() == Some(source_id)
+                && e.source.as_deref().is_none_or(|s| s == source)
+        })
+        .collect();
+    candidates
+        .iter()
+        .find(|e| e.is_current)
+        .or_else(|| candidates.iter().find(|e| e.position == position_restauree))
+        .or_else(|| candidates.first())
+        .copied()
+}
+
+fn now_playing_de_la_ligne_de_service(
+    entry: &tune_core::db::play_queue_repo::QueueEntry,
+    source: &str,
+) -> tune_core::playback::NowPlaying {
+    tune_core::playback::NowPlaying {
+        track_id: None,
+        title: entry.title.clone().unwrap_or_default(),
+        artist_name: entry.artist_name.clone(),
+        album_title: entry.album_title.clone(),
+        cover_path: entry.cover_path.clone(),
+        duration_ms: entry.duration_ms.unwrap_or(0).max(0),
+        source: source.to_string(),
+        source_id: entry.source_id.clone(),
+        ..Default::default()
     }
 }
 
@@ -4650,5 +4797,193 @@ mod tests_oubli_2145 {
         );
         // Sans identifiant, on ne sait pas : on continue comme avant.
         assert!(ligne_de_partage_existe(&etat, None));
+    }
+}
+
+#[cfg(test)]
+mod restauration_piste_de_service_6380_tests {
+    //! #6380 (Sandro, fil 2284) — au redémarrage, la piste en cours d'une zone
+    //! revient aussi quand elle vient d'un service.
+    //!
+    //! Chaque test passe par `restaurer_la_lecture`, l'enchaînement même
+    //! qu'appelle `init_state`. Base `:memory:`, aucun service connecté, aucun
+    //! appel réseau : c'est aussi la preuve que la piste se présente quand le
+    //! service n'est pas joignable.
+    use super::*;
+    use tune_core::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::playback::PlayState;
+
+    const DUREE: i64 = 300_000;
+    const POSITION: i64 = 87_000;
+
+    fn etat() -> (AppState, TuneConfig, tempfile::TempDir) {
+        let dossier = tempfile::tempdir().unwrap();
+        let config = TuneConfig {
+            db_path: dossier.path().join("tune.db").to_string_lossy().to_string(),
+            ..Default::default()
+        };
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        (state, config, dossier)
+    }
+
+    /// Une zone et sa file Qobuz de 5 titres, telles que la base les garde
+    /// d'une session à l'autre ; le titre `courant` (index) est la ligne
+    /// courante.
+    fn zone_et_file_qobuz(state: &AppState, courant: i64) -> i64 {
+        let zone_id = ZoneRepo::with_backend(state.backend.clone())
+            .create("Zone 1", Some("dlna"), Some("dlna:diretta"))
+            .unwrap();
+        let file = PlayQueueRepo::with_backend(state.backend.clone());
+        let lignes: Vec<QueueInput> = (1..=5)
+            .map(|n| QueueInput::Streaming {
+                source: "qobuz".into(),
+                source_id: format!("qobuz-{n}"),
+                title: format!("Titre {n}"),
+                artist: "No-Man".into(),
+                album: Some("Returning".into()),
+                cover_url: Some(format!("https://exemple.invalid/pochette-{n}.jpg")),
+                duration_ms: DUREE,
+                track_number: Some(n),
+                disc_number: Some(1),
+                album_ref: Some("album-1".into()),
+                artist_ref: None,
+            })
+            .collect();
+        file.append(zone_id, &lignes).unwrap();
+        file.set_current_pos(zone_id, courant).unwrap();
+        zone_id
+    }
+
+    /// LE cas de Sandro : file Qobuz de 5 titres, le 2e en cours à 87 s.
+    #[tokio::test]
+    async fn la_piste_qobuz_en_cours_revient_a_sa_position_sans_jouer() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 1);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-2"))
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        let np = zone
+            .now_playing
+            .as_ref()
+            .expect("« Aucune lecture en cours » alors que la file est là (#6380)");
+        assert_eq!(np.title, "Titre 2");
+        assert_eq!(np.source, "qobuz");
+        assert_eq!(np.source_id.as_deref(), Some("qobuz-2"));
+        assert_eq!(np.track_id, None);
+        assert_eq!(np.artist_name.as_deref(), Some("No-Man"));
+        assert_eq!(np.album_title.as_deref(), Some("Returning"));
+        assert_eq!(
+            np.cover_path.as_deref(),
+            Some("https://exemple.invalid/pochette-2.jpg")
+        );
+        assert_eq!(np.duration_ms, DUREE);
+        assert_ne!(zone.state, PlayState::Playing, "rien ne doit repartir seul");
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(zone.position_ms, POSITION);
+        assert_eq!(
+            zone.pending_resume_ms,
+            Some(POSITION),
+            "reprise armée à 87 s"
+        );
+        assert_eq!(zone.queue_position, 1, "le 2e titre de la file");
+        assert_eq!(zone.queue_length, 5);
+    }
+
+    /// Le chemin local ne change pas : piste de bibliothèque, même état.
+    #[tokio::test]
+    async fn la_piste_locale_revient_comme_avant() {
+        let (state, config, _d) = etat();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (id, title, duration_ms, file_path) \
+                 VALUES (77, 'Piste locale', 300000, '/musique/piste.flac')",
+                &[],
+            )
+            .unwrap();
+        let zones = ZoneRepo::with_backend(state.backend.clone());
+        let zone_id = zones.create("Salon", None, None).unwrap();
+        PlayQueueRepo::with_backend(state.backend.clone())
+            .set_queue(zone_id, &[77])
+            .unwrap();
+        zones
+            .save_playback_position(zone_id, POSITION, Some(77), Some("local"), None)
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        let np = zone.now_playing.as_ref().expect("piste locale restaurée");
+        assert_eq!(np.track_id, Some(77));
+        assert_eq!(np.title, "Piste locale");
+        assert_eq!(np.source, "local");
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(zone.position_ms, POSITION);
+        assert_eq!(zone.pending_resume_ms, Some(POSITION));
+    }
+
+    /// Une piste de service absente de la file : rien à présenter sans appeler
+    /// le service, donc rien n'est inventé — et la file, elle, reste là.
+    #[tokio::test]
+    async fn une_piste_de_service_absente_de_la_file_n_est_pas_inventee() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 0);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-999"))
+            .unwrap();
+
+        restaurer_la_lecture(&state, &config).await;
+
+        let zone = state.playback.get_state(zone_id).await;
+        assert!(zone.now_playing.is_none());
+        assert_eq!(zone.pending_resume_ms, None);
+        assert_eq!(zone.state, PlayState::Stopped);
+        assert_eq!(
+            PlayQueueRepo::with_backend(state.backend.clone())
+                .count_all(zone_id)
+                .unwrap(),
+            5
+        );
+    }
+
+    /// Contre-épreuve : la ligne est choisie par son `source_id`, pas par la
+    /// ligne courante. Ici la ligne courante est le 1er titre, mais c'est le
+    /// 4e qui jouait ; c'est lui qui revient, à sa place dans la file. Et une
+    /// AUTRE source portant le même identifiant n'est pas prise pour lui.
+    #[tokio::test]
+    async fn la_ligne_restauree_est_celle_de_la_piste_enregistree() {
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 0);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("qobuz"), Some("qobuz-4"))
+            .unwrap();
+        restaurer_la_lecture(&state, &config).await;
+        let zone = state.playback.get_state(zone_id).await;
+        assert_eq!(
+            zone.now_playing.as_ref().map(|np| np.title.as_str()),
+            Some("Titre 4")
+        );
+        assert_eq!(zone.queue_position, 3);
+
+        let (state, config, _d) = etat();
+        let zone_id = zone_et_file_qobuz(&state, 1);
+        ZoneRepo::with_backend(state.backend.clone())
+            .save_playback_position(zone_id, POSITION, None, Some("tidal"), Some("qobuz-2"))
+            .unwrap();
+        restaurer_la_lecture(&state, &config).await;
+        assert!(
+            state
+                .playback
+                .get_state(zone_id)
+                .await
+                .now_playing
+                .is_none(),
+            "une piste Tidal ne se restaure pas sur une ligne Qobuz"
+        );
     }
 }
