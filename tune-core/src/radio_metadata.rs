@@ -1106,11 +1106,28 @@ async fn fetch_azuracast_metadata(api_url: &str, station_name: &str) -> Option<I
 // Raw ICY metadata (fallback)
 // ---------------------------------------------------------------------------
 
+/// Le délai total du repli ICY : connexion, en-têtes ET lecture du flux.
+const ICY_DELAI: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Plafond absolu d'octets lus sur un direct avant d'abandonner (#6373).
+const ICY_OCTETS_MAX: usize = 512 * 1024;
+
+/// Combien de périodes `icy-metaint` on lit au plus : le premier bloc est
+/// souvent vide (le serveur ne répète le titre qu'au changement), le suivant
+/// porte d'ordinaire le titre.
+const ICY_PERIODES_MAX: usize = 3;
+
 async fn fetch_icy_metadata(stream_url: &str) -> Option<IcyMetadata> {
-    let client = crate::http::client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .ok()?;
+    fetch_icy_metadata_dans(stream_url, ICY_DELAI).await
+}
+
+/// `delai` borne la requête ENTIÈRE, lecture du corps comprise : sur un
+/// direct, le corps ne finit jamais.
+async fn fetch_icy_metadata_dans(
+    stream_url: &str,
+    delai: std::time::Duration,
+) -> Option<IcyMetadata> {
+    let client = crate::http::client::builder().timeout(delai).build().ok()?;
 
     let resp = client
         .get(stream_url)
@@ -1133,26 +1150,116 @@ async fn fetch_icy_metadata(stream_url: &str) -> Option<IcyMetadata> {
 
     // We need to read `icy_metaint` bytes of audio, then one length byte,
     // then `length * 16` bytes of metadata text.
-    let bytes = resp.bytes().await.ok()?;
+    //
+    // Un direct ne finit jamais : lire le corps entier (`resp.bytes()`)
+    // attendait le délai puis rendait `None` (#6373). On lit donc le flux
+    // morceau par morceau et l'on s'arrête au premier bloc titré, ou au
+    // plafond d'octets, ou au délai du client — jamais plus.
+    lire_titre_icy(resp, icy_metaint, station).await
+}
 
-    if bytes.len() <= icy_metaint {
+/// Lit un flux ICY au fil de l'eau jusqu'au premier bloc qui porte un titre.
+async fn lire_titre_icy(
+    mut resp: reqwest::Response,
+    metaint: usize,
+    station: Option<String>,
+) -> Option<IcyMetadata> {
+    if metaint == 0 {
         return None;
     }
+    // Une période = `metaint` octets d'audio, l'octet de longueur, puis au
+    // plus 255 × 16 octets de bloc.
+    let plafond = metaint
+        .saturating_add(1 + 255 * 16)
+        .saturating_mul(ICY_PERIODES_MAX)
+        .min(ICY_OCTETS_MAX);
+    let mut lecteur = LecteurIcy::new(metaint);
+    let mut lus = 0usize;
+    while let Some(morceau) = resp.chunk().await.ok().flatten() {
+        lus = lus.saturating_add(morceau.len());
+        for bloc in lecteur.pousser(&morceau) {
+            if let Some(meta) = parse_icy_string(&decoder_bloc_icy(&bloc), station.clone()) {
+                return Some(meta);
+            }
+        }
+        if lus >= plafond {
+            debug!(lus, plafond, "icy_aucun_titre_sous_le_plafond");
+            return None;
+        }
+    }
+    None
+}
 
-    let meta_length_byte = bytes[icy_metaint] as usize;
-    if meta_length_byte == 0 {
-        return None;
+/// Découpe un flux ICY en blocs de métadonnées, quel que soit le découpage
+/// des morceaux reçus (un bloc peut chevaucher deux morceaux).
+struct LecteurIcy {
+    metaint: usize,
+    etat: EtatIcy,
+}
+
+enum EtatIcy {
+    /// Octets d'audio restant à sauter avant l'octet de longueur.
+    Audio(usize),
+    /// Le prochain octet est la longueur du bloc, en multiples de 16.
+    Longueur,
+    /// Un bloc en cours : sa taille attendue et ce qui en est déjà lu.
+    Bloc(usize, Vec<u8>),
+}
+
+impl LecteurIcy {
+    fn new(metaint: usize) -> Self {
+        Self {
+            metaint,
+            etat: EtatIcy::Audio(metaint),
+        }
     }
 
-    let meta_len = meta_length_byte * 16;
-    let meta_start = icy_metaint + 1;
-    let meta_end = meta_start + meta_len;
-    if bytes.len() < meta_end {
-        return None;
+    /// Avale `octets` et rend les blocs NON VIDES complétés au passage.
+    fn pousser(&mut self, mut octets: &[u8]) -> Vec<Vec<u8>> {
+        let mut blocs = Vec::new();
+        while !octets.is_empty() {
+            match &mut self.etat {
+                EtatIcy::Audio(restant) => {
+                    let n = (*restant).min(octets.len());
+                    *restant -= n;
+                    octets = &octets[n..];
+                    if *restant == 0 {
+                        self.etat = EtatIcy::Longueur;
+                    }
+                }
+                EtatIcy::Longueur => {
+                    let taille = octets[0] as usize * 16;
+                    octets = &octets[1..];
+                    self.etat = if taille == 0 {
+                        EtatIcy::Audio(self.metaint)
+                    } else {
+                        EtatIcy::Bloc(taille, Vec::with_capacity(taille))
+                    };
+                }
+                EtatIcy::Bloc(taille, lu) => {
+                    let n = (*taille - lu.len()).min(octets.len());
+                    lu.extend_from_slice(&octets[..n]);
+                    octets = &octets[n..];
+                    if lu.len() == *taille {
+                        blocs.push(std::mem::take(lu));
+                        self.etat = EtatIcy::Audio(self.metaint);
+                    }
+                }
+            }
+        }
+        blocs
     }
+}
 
-    let raw = String::from_utf8_lossy(&bytes[meta_start..meta_end]);
-    parse_icy_string(&raw, station)
+/// Le texte d'un bloc ICY. Le protocole ne fixe pas d'encodage : les
+/// serveurs récents écrivent de l'UTF-8, beaucoup d'anciens du Latin-1. Un
+/// bloc qui n'est pas de l'UTF-8 valide est lu comme du Latin-1 (chaque octet
+/// est le point de code de même valeur), plutôt que semé de « � ».
+fn decoder_bloc_icy(octets: &[u8]) -> std::borrow::Cow<'_, str> {
+    match std::str::from_utf8(octets) {
+        Ok(texte) => std::borrow::Cow::Borrowed(texte),
+        Err(_) => std::borrow::Cow::Owned(octets.iter().map(|&o| o as char).collect()),
+    }
 }
 
 /// Lire un champ `Nom='valeur'` d'un bloc ICY.
@@ -1160,12 +1267,36 @@ async fn fetch_icy_metadata(stream_url: &str) -> Option<IcyMetadata> {
 /// Le bloc est une suite de `Cle='valeur';`. On cherche la clé suivie de `='`
 /// et l'on s'arrête au premier `';` — c'est déjà ce que faisait l'extraction du
 /// titre, extraite ici pour servir les DEUX champs plutôt qu'un seul.
+///
+/// Un titre peut lui-même contenir `';` (« Rock 'n';roll ») : on ne retient
+/// donc que le `';` suivi de la fin du bloc ou d'un autre champ `Cle='`. S'il
+/// n'y en a aucun, le premier `';` fait foi, comme avant.
 fn champ_icy<'a>(bloc: &'a str, cle: &str) -> Option<&'a str> {
     let ouvrant = format!("{cle}='");
     let debut = bloc.find(&ouvrant)?;
     let apres = &bloc[debut + ouvrant.len()..];
-    let fin = apres.find("';")?;
+    let premiere = apres.find("';")?;
+    let fin = apres
+        .match_indices("';")
+        .map(|(i, _)| i)
+        .find(|&i| fin_de_champ_icy(&apres[i + 2..]))
+        .unwrap_or(premiere);
     Some(&apres[..fin])
+}
+
+/// Ce qui suit un `';` clôt-il le champ ? Oui en fin de bloc (bourrage de
+/// `\0` compris) ou devant un autre champ `Cle='`.
+fn fin_de_champ_icy(reste: &str) -> bool {
+    let reste = reste.trim_start_matches([' ', '\0']);
+    if reste.is_empty() {
+        return true;
+    }
+    match reste.find("='") {
+        Some(i) if i > 0 => reste[..i]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        _ => false,
+    }
 }
 
 /// La pochette qu'une station publie dans `StreamUrl`, quand c'en est une.
@@ -2993,5 +3124,247 @@ mod tests {
         let mut corps = charge_azuracast(POCHETTE_AZURACAST);
         corps["now_playing"]["song"]["title"] = json!("");
         assert!(lire_now_playing_azuracast(&corps, "Reggae Classic Mix").is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #6373 — le titre ICY d'un DIRECT : un corps qui ne finit jamais
+// ---------------------------------------------------------------------------
+//
+// `fetch_icy_metadata` lisait le corps entier (`resp.bytes()`). Un direct ne
+// finit jamais : la requête expirait au bout de 10 s et rendait `None`, et
+// aucune station MP3/AAC sans service dédié n'affichait son titre. Le faux
+// Icecast ci-dessous envoie un flux SANS FIN, comme un vrai : seul un lecteur
+// au fil de l'eau en sort un titre.
+#[cfg(test)]
+mod tests_icy_direct_6373 {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const METAINT: usize = 64;
+
+    /// Ce que fait le faux serveur une fois ses blocs envoyés.
+    #[derive(Clone, Copy)]
+    enum Suite {
+        /// Des périodes d'audio à bloc vide, à l'infini.
+        SansFin,
+        /// Une demi-période d'audio, puis plus rien, connexion ouverte.
+        Muet,
+    }
+
+    /// Un faux Icecast. `metaint` : `None` = serveur qui ignore
+    /// `Icy-MetaData` (ni en-tête, ni bloc). `blocs` : le bloc de chaque
+    /// période, dans l'ordre (vide = octet de longueur 0). Rend l'URL et un
+    /// témoin « le client a réclamé `Icy-MetaData: 1` ».
+    async fn faux_icecast(
+        metaint: Option<usize>,
+        blocs: Vec<Vec<u8>>,
+        suite: Suite,
+    ) -> (String, Arc<AtomicBool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port local");
+        let port = listener.local_addr().expect("adresse locale").port();
+        let reclame = Arc::new(AtomicBool::new(false));
+        let temoin = reclame.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let blocs = blocs.clone();
+                let temoin = temoin.clone();
+                tokio::spawn(async move {
+                    let mut requete = Vec::new();
+                    let mut tampon = [0u8; 1024];
+                    while !requete.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut tampon).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => requete.extend_from_slice(&tampon[..n]),
+                        }
+                    }
+                    let texte = String::from_utf8_lossy(&requete).to_ascii_lowercase();
+                    if texte.contains("icy-metadata: 1") {
+                        temoin.store(true, Ordering::SeqCst);
+                    }
+                    let mut entetes = String::from(
+                        "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nicy-name: Faux Icecast\r\n",
+                    );
+                    if let Some(m) = metaint {
+                        entetes.push_str(&format!("icy-metaint: {m}\r\n"));
+                    }
+                    entetes.push_str("Connection: close\r\n\r\n");
+                    if sock.write_all(entetes.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    let Some(m) = metaint else {
+                        // Serveur qui ignore la demande : de l'audio, sans fin.
+                        while sock.write_all(&[0xFF; 512]).await.is_ok() {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        return;
+                    };
+                    let mut blocs = blocs.into_iter();
+                    loop {
+                        let bloc = match (blocs.next(), suite) {
+                            (Some(b), _) => b,
+                            (None, Suite::SansFin) => Vec::new(),
+                            (None, Suite::Muet) => {
+                                let _ = sock.write_all(&vec![0xFF; m / 2]).await;
+                                std::future::pending::<()>().await;
+                                return;
+                            }
+                        };
+                        let mut periode = vec![0xFF; m];
+                        let taille = bloc.len().div_ceil(16);
+                        periode.push(taille as u8);
+                        periode.extend_from_slice(&bloc);
+                        periode.resize(m + 1 + taille * 16, 0);
+                        if sock.write_all(&periode).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}/flux.mp3"), reclame)
+    }
+
+    /// Un premier bloc vide (longueur 0), un bloc au titre vide, puis le titre.
+    fn blocs_titres(titre: &[u8]) -> Vec<Vec<u8>> {
+        vec![Vec::new(), b"StreamTitle='';".to_vec(), titre.to_vec()]
+    }
+
+    /// **Le rouge de #6373.** Sur un flux sans fin, l'ancienne lecture
+    /// attendait la fin du corps, expirait à 10 s et rendait `None`.
+    #[tokio::test]
+    async fn un_direct_sans_fin_livre_le_titre_du_premier_bloc_non_vide() {
+        let (url, reclame) = faux_icecast(
+            Some(METAINT),
+            blocs_titres(b"StreamTitle='Miles Davis - So What';StreamUrl='';"),
+            Suite::SansFin,
+        )
+        .await;
+        let debut = Instant::now();
+        let meta = fetch_icy_metadata(&url)
+            .await
+            .expect("le titre d'un direct doit se lire sans attendre la fin du flux");
+        assert!(
+            debut.elapsed() < Duration::from_secs(5),
+            "lu en {:?} : le lecteur a attendu au lieu de s'arrêter au bloc titré",
+            debut.elapsed()
+        );
+        assert_eq!(meta.artist.as_deref(), Some("Miles Davis"));
+        assert_eq!(meta.title, "So What");
+        assert_eq!(meta.station.as_deref(), Some("Faux Icecast"));
+        assert!(
+            reclame.load(Ordering::SeqCst),
+            "Icy-MetaData: 1 doit être réclamé"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_bloc_en_latin1_se_lit_sans_caractere_de_remplacement() {
+        let (url, _) = faux_icecast(
+            Some(METAINT),
+            blocs_titres(b"StreamTitle='L\xe9o Ferr\xe9 - Avec le temps';"),
+            Suite::SansFin,
+        )
+        .await;
+        let meta = fetch_icy_metadata(&url).await.expect("titre Latin-1");
+        assert_eq!(meta.artist.as_deref(), Some("Léo Ferré"));
+        assert_eq!(meta.title, "Avec le temps");
+    }
+
+    #[tokio::test]
+    async fn un_bloc_en_utf8_se_lit_tel_quel() {
+        let (url, _) = faux_icecast(
+            Some(METAINT),
+            blocs_titres("StreamTitle='Björk - Jóga';".as_bytes()),
+            Suite::SansFin,
+        )
+        .await;
+        let meta = fetch_icy_metadata(&url).await.expect("titre UTF-8");
+        assert_eq!(meta.artist.as_deref(), Some("Björk"));
+        assert_eq!(meta.title, "Jóga");
+    }
+
+    #[tokio::test]
+    async fn apostrophes_et_points_virgules_restent_dans_le_titre() {
+        let (url, _) = faux_icecast(
+            Some(METAINT),
+            blocs_titres(b"StreamTitle='Guns N' Roses - Sweet Child O' Mine; Live';StreamUrl='';"),
+            Suite::SansFin,
+        )
+        .await;
+        let meta = fetch_icy_metadata(&url).await.expect("titre à apostrophes");
+        assert_eq!(meta.artist.as_deref(), Some("Guns N' Roses"));
+        assert_eq!(meta.title, "Sweet Child O' Mine; Live");
+
+        let meta = parse_icy_string(
+            "StreamTitle='Bill Haley - Rock 'n';roll Party';StreamUrl='https://x.test/a.jpg';",
+            None,
+        )
+        .expect("un `';` au milieu du titre ne le coupe pas");
+        assert_eq!(meta.title, "Rock 'n';roll Party");
+        assert_eq!(meta.cover_url.as_deref(), Some("https://x.test/a.jpg"));
+
+        let meta = parse_icy_string("StreamTitle='Les Rita Mitsouko - Andy'';\0\0", None)
+            .expect("titre qui finit par une apostrophe");
+        assert_eq!(meta.title, "Andy'");
+    }
+
+    #[tokio::test]
+    async fn un_serveur_qui_ignore_icy_metadata_rend_none_sans_attendre() {
+        let (url, reclame) = faux_icecast(None, Vec::new(), Suite::SansFin).await;
+        let debut = Instant::now();
+        assert!(fetch_icy_metadata(&url).await.is_none());
+        assert!(debut.elapsed() < Duration::from_secs(5));
+        assert!(reclame.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn un_flux_muet_rend_none_au_delai() {
+        let (url, _) = faux_icecast(Some(METAINT), Vec::new(), Suite::Muet).await;
+        let debut = Instant::now();
+        assert!(
+            fetch_icy_metadata_dans(&url, Duration::from_millis(500))
+                .await
+                .is_none()
+        );
+        let duree = debut.elapsed();
+        assert!(
+            duree >= Duration::from_millis(400) && duree < Duration::from_secs(5),
+            "le délai doit borner la lecture ({duree:?})"
+        );
+    }
+
+    #[tokio::test]
+    async fn un_direct_sans_titre_s_arrete_au_plafond_d_octets() {
+        let (url, _) = faux_icecast(Some(METAINT), Vec::new(), Suite::SansFin).await;
+        let debut = Instant::now();
+        assert!(fetch_icy_metadata(&url).await.is_none());
+        assert!(
+            debut.elapsed() < Duration::from_secs(8),
+            "le plafond d'octets doit couper avant le délai ({:?})",
+            debut.elapsed()
+        );
+    }
+
+    #[test]
+    fn le_lecteur_recolle_un_bloc_coupe_entre_deux_morceaux() {
+        let mut flux = vec![0xAA; 8];
+        flux.push(0); // bloc vide
+        flux.extend_from_slice(&[0xAA; 8]);
+        flux.push(2);
+        let mut bloc = b"StreamTitle='A - B';".to_vec();
+        bloc.resize(32, 0);
+        flux.extend_from_slice(&bloc);
+        flux.extend_from_slice(&[0xAA; 3]);
+
+        let mut lecteur = LecteurIcy::new(8);
+        let blocs: Vec<Vec<u8>> = flux.iter().flat_map(|o| lecteur.pousser(&[*o])).collect();
+        assert_eq!(blocs, vec![bloc]);
     }
 }

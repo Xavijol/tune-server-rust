@@ -11,6 +11,9 @@ use crate::TuneError;
 /// lisible (typiquement un fichier encore en cours d'écriture au moment où
 /// le watcher le voit). Partagé entre le scanner et les repos pour que la
 /// détection « artiste inconnu » compare toujours la même chaîne.
+mod sources_des_artistes;
+pub use sources_des_artistes::{PresenceDansUneSource, SourcesDesArtistes};
+
 pub const UNKNOWN_ARTIST_NAME: &str = "Unknown Artist";
 
 /// Engine-agnostic SQL builders for artist_repo.

@@ -225,6 +225,12 @@ path = "tests/ordre_des_passes_5169.rs"
 name = "rattrapage_foo_dr_5168"
 path = "tests/rattrapage_foo_dr_5168.rs"
 
+# #5519 — le gain approché depuis foo_dr.txt, plafonné par la crête.
+# `autotests = false` : sans cette cible, le fichier ne serait jamais compilé.
+[[test]]
+name = "gain_approche_foo_dr_5519"
+path = "tests/gain_approche_foo_dr_5519.rs"
+
 # #5594 — la clé du signal PCM des FLAC et son rattrapage par en-tête. Binaire
 # à lui seul : la pause des tâches de fond est un état de PROCESSUS.
 [[test]]
@@ -363,6 +369,18 @@ path = "tests/ape_incremental_i2505.rs"
 [[test]]
 name = "ape_pic_memoire_i2505"
 path = "tests/ape_pic_memoire_i2505.rs"
+
+# #6168 — seuil mmap de la glibc fixé au démarrage. Binaire à lui seul : il
+# se relance en processus fils, l'état de l'allocateur est global.
+[[test]]
+name = "seuil_mmap_glibc_6168"
+path = "tests/seuil_mmap_glibc_6168.rs"
+
+# #6168 — pic mémoire de l'import des playlists en fin de scan. Binaire à lui
+# seul : il pose un `#[global_allocator]` qui suit le pic d'octets vivants.
+[[test]]
+name = "playlists_du_scan_memoire_6168"
+path = "tests/playlists_du_scan_memoire_6168.rs"
 
 # `autotests = false` : sans cette cible, le fichier ne serait jamais compile.
 # Il tient le resume de fin de scan (#2939) — un scan qui perd des pistes ne
@@ -513,6 +531,9 @@ windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
     "Win32_System_Power",
+    # #5410 — la température des zones thermiques (compteurs PDH « Thermal
+    # Zone Information »), pour la garde thermique des analyses.
+    "Win32_System_Performance",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que

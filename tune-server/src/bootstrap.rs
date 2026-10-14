@@ -545,6 +545,14 @@ pub async fn run_with(opts: RunOptions) {
         fils_de_travail = crate::fils_de_travail::retenu(),
         "tune_server_starting"
     );
+    // #6168 — idempotent : rend ce que le moteur a appliqué, ou l'applique
+    // pour un binaire composeur qui ne passe pas par `construire_le_moteur`.
+    let seuil_mmap = tune_core::memoire_rendue::fixer_le_seuil_mmap();
+    tracing::info!(
+        issue = ?seuil_mmap,
+        detail = %seuil_mmap.libelle(),
+        "glibc_seuil_mmap"
+    );
 
     routes::spotify_connect::auto_start(&state).await;
 

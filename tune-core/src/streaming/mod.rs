@@ -1,4 +1,6 @@
 pub mod amazon;
+/// Favoris radio → playlist chez un service (aperçu, puis création).
+pub mod appariement_favoris_radio;
 pub mod cadence_du_flux;
 pub mod deezer;
 pub mod deezer_decrypt;

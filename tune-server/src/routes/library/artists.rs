@@ -10,7 +10,7 @@ use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
 use tune_core::db::track_repo::{TrackRepo, dedup_display_tracks};
 
-use super::{Pagination, api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
+use super::{api_cache_get, api_cache_set, artwork_cache_dir, now_iso_utc};
 
 #[derive(Deserialize)]
 pub(super) struct LangQuery {
@@ -205,13 +205,65 @@ pub(super) async fn artists_doublons(State(state): State<AppState>) -> Json<Valu
     }))
 }
 
+/// `GET /library/artists` : la pagination, et `provenances=1` (tune-web-client#1716).
+#[derive(Deserialize)]
+pub(super) struct ArtistsQuery {
+    limit: Option<i64>,
+    offset: Option<i64>,
+    /// `1` / `true` : chaque artiste porte `provenances`, ses albums et pistes
+    /// visibles par clé de provenance. Absent : la réponse d'avant, au
+    /// caractère près, et aucune requête de plus.
+    provenances: Option<String>,
+}
+
+fn veut_les_sources(v: Option<&str>) -> bool {
+    matches!(v.map(str::trim), Some("1" | "true"))
+}
+
+/// Pose `provenances` sur chaque artiste de la page — tune-web-client#1716.
+///
+/// L'onglet Artistes chargeait toute la bibliothèque (pistes ET albums) pour
+/// calculer ces sources dans le navigateur. Elles viennent maintenant d'ici,
+/// pour la page seulement. Un artiste sans album ni piste visible reçoit `{}` :
+/// le client le lit comme « aucune source », comme avant.
+fn joindre_les_sources(
+    items: &mut [Value],
+    sources: &tune_core::db::artist_repo::SourcesDesArtistes,
+) {
+    for item in items {
+        let Some(obj) = item.as_object_mut() else {
+            continue;
+        };
+        let id = obj.get("id").and_then(Value::as_i64);
+        let s = id.and_then(|id| sources.get(&id));
+        obj.insert("provenances".into(), json!(s.cloned().unwrap_or_default()));
+    }
+}
+
 pub(super) async fn list_artists(
     State(state): State<AppState>,
-    Query(p): Query<Pagination>,
+    Query(p): Query<ArtistsQuery>,
 ) -> Json<Value> {
-    let repo = ArtistRepo::with_backend(state.backend.clone());
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
+    // Les lectures sont synchrones (rusqlite) : hors de l'exécuteur, comme
+    // `GET /library/tracks` (#5138). Les sources parcourent les pistes.
+    let avec_sources = veut_les_sources(p.provenances.as_deref());
+    match tokio::task::spawn_blocking(move || {
+        lire_la_page_d_artistes(&state, limit, offset, avec_sources)
+    })
+    .await
+    {
+        Ok(corps) => Json(corps),
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_tache_bloquante_perdue");
+            Json(json!({"items": [], "total": 0, "limit": limit, "offset": offset}))
+        }
+    }
+}
+
+fn lire_la_page_d_artistes(state: &AppState, limit: i64, offset: i64, avec_sources: bool) -> Value {
+    let repo = ArtistRepo::with_backend(state.backend.clone());
     let total = repo.count().unwrap_or(0);
     let items = match repo.list(limit, offset) {
         Ok(artists) => artists,
@@ -226,7 +278,22 @@ pub(super) async fn list_artists(
             Vec::new()
         }
     };
-    Json(json!({"items": items, "total": total, "limit": limit, "offset": offset}))
+    if !avec_sources {
+        return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+    }
+    let ids: Vec<i64> = items.iter().filter_map(|a| a.id).collect();
+    // Un échec ne pose PAS `provenances` : un `{}` dirait « aucune source » à
+    // tort, alors que son absence fait retomber le client sur son calcul.
+    let sources = match repo.sources_des_artistes(&ids) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(error = %e, "list_artists_sources_query_failed");
+            return json!({"items": items, "total": total, "limit": limit, "offset": offset});
+        }
+    };
+    let mut items: Vec<Value> = items.iter().map(|a| json!(a)).collect();
+    joindre_les_sources(&mut items, &sources);
+    json!({"items": items, "total": total, "limit": limit, "offset": offset})
 }
 
 pub(super) async fn get_artist(

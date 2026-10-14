@@ -1067,6 +1067,7 @@ mod tests {
     /// rougir `traitees == 0` : le tour part chercher le MBID sur MusicBrainz.
     #[tokio::test]
     async fn un_tour_suspendu_ne_traite_rien_et_garde_son_curseur() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
         use tune_core::db::backend::ToSqlValue;
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let b = &state.backend;
@@ -1081,14 +1082,12 @@ mod tests {
         )
         .unwrap();
 
-        tune_core::taches_de_fond::oublier_pour_les_essais();
         tune_core::taches_de_fond::mettre_en_pause(
             b,
             tune_core::taches_de_fond::Tache::Enrichissement,
         )
         .unwrap();
         let bilan = un_tour_de_credits(&state).await;
-        tune_core::taches_de_fond::oublier_pour_les_essais();
 
         assert_eq!(
             bilan.traitees, 0,

@@ -666,7 +666,44 @@ pub(super) async fn enrich_all_status(State(state): State<AppState>) -> Json<Val
         // only `status` while idle made the typed response false and forced
         // callers to paper over missing fields (#1897).
         .unwrap_or(json!({"status": "idle", "enriched": 0, "total": 0}));
-    Json(result)
+    Json(statut_reel(
+        result,
+        tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::Enrichissement),
+        state
+            .background_tasks
+            .snapshot()
+            .iter()
+            .any(|t| t.id == "enrich_all"),
+    ))
+}
+
+/// #6282 — le réglage `enrich_all_status` dit « running » du lancement de la
+/// passe à sa fin, et RIEN entre les deux ne le réécrit quand elle se gare.
+/// Kimon (fil 2259) : enrichissement suspendu, la carte de l'écran État du
+/// serveur disait « en pause » et les Réglages « En cours… » au même instant,
+/// sur « 0 sur 110 781 ».
+///
+/// Le statut servi est donc l'état RÉEL, pas le réglage tel quel :
+/// * `paused` quand la passe vit mais que l'enrichissement est suspendu —
+///   elle est garée à sa frontière ;
+/// * `interrupted` quand le réglage dit « running » sans aucune passe au
+///   registre : un arrêt du serveur l'a tuée avant sa fin (la reprise de
+///   #5469 en relancera une, qui réécrira « running »).
+///
+/// Sur une passe ouverte (« running » en base), `paused` est aussi servi en
+/// booléen, pour un client qui lit le statut comme `running | done | idle`.
+/// Un relevé `done` ou `idle` est servi tel quel.
+fn statut_reel(mut releve: Value, en_pause: bool, passe_vivante: bool) -> Value {
+    let running = releve.get("status").and_then(Value::as_str) == Some("running");
+    if running && let Some(obj) = releve.as_object_mut() {
+        if !passe_vivante {
+            obj.insert("status".into(), json!("interrupted"));
+        } else if en_pause {
+            obj.insert("status".into(), json!("paused"));
+        }
+        obj.insert("paused".into(), json!(passe_vivante && en_pause));
+    }
+    releve
 }
 
 // ── MusicBrainz helper functions (HTTP autonome ; l'analyse des reponses est
