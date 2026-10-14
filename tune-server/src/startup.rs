@@ -453,6 +453,15 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
 
     reset_zones_offline(state);
     marquer_enrichissements_interrompus(state);
+    // #6255 — le détecteur de bruit des lecteurs réseau, éteint seulement
+    // par un « non » explicite.
+    tune_core::http::bruit_reseau::regler(tune_core::http::bruit_reseau::resoudre(
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .get(tune_core::http::bruit_reseau::CLE_REGLAGE)
+            .ok()
+            .flatten()
+            .as_deref(),
+    ));
     ouvrir_le_registre_des_executions(state);
     deduplicate_zones(state);
     ensure_zones_is_hidden(state);
