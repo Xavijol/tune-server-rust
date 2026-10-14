@@ -13,6 +13,9 @@ use serde_json::{Value, json};
 
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use tune_core::http::streamer::AudioStreamer;
+use tune_core::streaming::appariement_favoris_radio::{
+    apparier_favori_radio, creer_playlist_avec_titres, dedoublonner_titres, scinder_titre_icy,
+};
 
 use crate::error::AppError;
 use crate::routes::active_profile::DEFAULT_PROFILE_ID;
@@ -2081,6 +2084,7 @@ pub fn radio_favorites_router() -> Router<AppState> {
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
         .route("/create-playlist", post(create_playlist_from_favorites))
+        .route("/match-preview", post(apercu_appariement_favoris))
         .route("/{fav_id}", axum::routing::delete(delete_radio_favorite))
 }
 
@@ -2273,6 +2277,11 @@ struct CreatePlaylistFromFavBody {
     /// (e.g. "qobuz", "tidal", "deezer").
     service: Option<String>,
     limit: Option<usize>,
+    /// Les titres RETENUS par l'utilisateur après l'aperçu
+    /// (`POST /radio-favorites/match-preview`), identifiants du service.
+    /// Présent : aucun nouvel appariement, la playlist reçoit exactement ces
+    /// titres (dédoublonnés). Absent : la création « en un geste » d'avant.
+    track_ids: Option<Vec<String>>,
 }
 
 /// Les trois compteurs que l'écran « Favoris radio → Créer une playlist »
@@ -2341,6 +2350,19 @@ async fn create_playlist_from_favorites(
             .into_response());
     }
 
+    // Les titres déjà VALIDÉS à l'aperçu : on ne rapparie rien.
+    if let Some(Json(ref b)) = body
+        && let Some(ref ids) = b.track_ids
+    {
+        let name = b
+            .playlist_name
+            .clone()
+            .or(b.name.clone())
+            .unwrap_or_else(|| "Radio Favorites".into());
+        return creer_playlist_depuis_titres_retenus(&state, b.service.as_deref(), &name, ids)
+            .await;
+    }
+
     let (name, limit, service) = match body {
         Some(Json(ref b)) => {
             let n = b
@@ -2366,17 +2388,7 @@ async fn create_playlist_from_favorites(
     // titre et rien ne matche (forum #1234, Xavier).
     let favorites: Vec<(String, String)> = favorites
         .into_iter()
-        .map(|(title, artist)| {
-            if artist.trim().is_empty()
-                && let Some((a, t)) = title.split_once(" - ")
-            {
-                let (a, t) = (a.trim(), t.trim());
-                if !a.is_empty() && !t.is_empty() {
-                    return (t.to_string(), a.to_string());
-                }
-            }
-            (title, artist)
-        })
+        .map(|(title, artist)| scinder_titre_icy(&title, &artist))
         .collect();
 
     // Streaming target: resolve each favorite onto the service (smart-matched,
@@ -2567,89 +2579,14 @@ async fn create_streaming_playlist_from_favorites(
     let mut matched_ids: Vec<String> = Vec::new();
     let mut details: Vec<Value> = Vec::new();
     for (title, artist) in favorites {
-        // radio favorites carry no ISRC/duration, so match on normalized title+artist.
-        //
-        // Requêtes essayées dans l'ordre : « artiste titre », puis titre seul,
-        // puis titre tronqué avant « ( » ou « - ». Le matcher normalise déjà les
-        // suffixes « (feat. X) / (Live) » pour SCORER, mais la REQUÊTE envoyée
-        // au service les contenait encore, et Qobuz ne renvoyait alors aucun
-        // candidat (#1235 : une recherche manuelle sans le suffixe trouvait la
-        // piste). On s'arrête à la première requête qui produit un match sûr ;
-        // à défaut, on garde le meilleur match approximatif (0.6–0.7) rencontré,
-        // exposé `status: "approximate"` — avant, cette bande était jetée et
-        // devenait « not_found ».
-        let mut queries: Vec<String> = Vec::new();
-        if artist.is_empty() {
-            queries.push(title.clone());
-        } else {
-            queries.push(format!("{artist} {title}"));
-            queries.push(title.clone());
-        }
-        let stripped = title
-            .split_once(" (")
-            .map(|(a, _)| a)
-            .unwrap_or(title)
-            .split_once(" - ")
-            .map(|(a, _)| a)
-            .unwrap_or_else(|| title.split_once(" (").map(|(a, _)| a).unwrap_or(title))
-            .trim()
-            .to_string();
-        if !stripped.is_empty() && stripped != *title {
-            if artist.is_empty() {
-                queries.push(stripped.clone());
-            } else {
-                queries.push(format!("{artist} {stripped}"));
-            }
-        }
-
-        // Instrumentation for #1235 (Reivax66: "aucun résultat trouvé" on Qobuz
-        // even though a manual Qobuz search finds the track). Without logging we
-        // cannot tell three very different failure modes apart: the service
-        // search erroring (previously swallowed by `Err(_) => None`), the search
-        // returning zero candidates, or the matcher rejecting every candidate.
-        // Log the query, result count, the top candidate the service returned,
-        // and the accept/reject decision so the next tester log pinpoints it.
-        let mut best: Option<(tune_core::streaming::traits::StreamTrack, f64)> = None;
-        for q in &queries {
-            match svc.search(q, 10).await {
-                Ok(results) => {
-                    let n = results.tracks.len();
-                    let top = results
-                        .tracks
-                        .first()
-                        .map(|t| format!("{} — {}", t.artist, t.title))
-                        .unwrap_or_else(|| "<none>".into());
-                    match tune_core::streaming::matching::best_stream_match_scored(
-                        title,
-                        artist,
-                        "",
-                        0,
-                        &results.tracks,
-                    ) {
-                        Some((t, score))
-                            if score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE =>
-                        {
-                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_ok");
-                            best = Some((t.clone(), score));
-                            break;
-                        }
-                        Some((t, score)) => {
-                            tracing::info!(service = %service, query = %q, results = n, top = %top, score, "radio_fav_match_approx");
-                            if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
-                                best = Some((t.clone(), score));
-                            }
-                        }
-                        None => {
-                            tracing::warn!(service = %service, query = %q, results = n, top = %top, "radio_fav_match_rejected");
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(service = %service, query = %q, error = %e, "radio_fav_search_failed");
-                }
-            }
-        }
-        match best {
+        // Radio favorites carry no ISRC/duration: match on normalized
+        // title+artist. Requêtes, seuils et choix du vainqueur vivent dans
+        // `apparier_favori_radio`, partagé avec l'aperçu
+        // (`/radio-favorites/match-preview`) : les deux chemins désignent la
+        // même piste. Ici, comme avant, une ambiguïté compte comme un match
+        // sûr — seul l'aperçu sait la faire trancher.
+        let a = apparier_favori_radio(&*svc, service, title, artist).await;
+        match a.meilleur {
             Some((t, score)) => {
                 let sure = score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE;
                 details.push(json!({
@@ -2736,6 +2673,255 @@ async fn create_streaming_playlist_from_favorites(
         })),
     )
         .into_response())
+}
+
+/// Le service visé, s'il peut recevoir une playlist : inscrit, connecté, et
+/// capable d'écrire. Sinon, la réponse d'erreur à rendre telle quelle.
+///
+/// Vérifié AVANT l'aperçu : chercher deux cents favoris chez un service qui
+/// refusera ensuite la création ferait attendre l'utilisateur pour rien.
+async fn service_pour_playlist(
+    state: &AppState,
+    service: &str,
+) -> Result<
+    Arc<tokio::sync::RwLock<Box<dyn tune_core::streaming::traits::StreamingService>>>,
+    axum::response::Response,
+> {
+    let refus = |code: StatusCode, err: &str, message: String| {
+        (code, Json(json!({ "error": err, "message": message }))).into_response()
+    };
+    let Some(arc) = state.services.lock().await.get(service) else {
+        return Err(refus(
+            StatusCode::BAD_REQUEST,
+            "service_inconnu",
+            format!("service '{service}' not found or not connected"),
+        ));
+    };
+    {
+        let svc = arc.read().await;
+        if !svc.utilisable().await {
+            return Err(refus(
+                StatusCode::CONFLICT,
+                "service_non_connecte",
+                format!("service '{service}' is not connected"),
+            ));
+        }
+        if !svc.supports_write() {
+            return Err(refus(
+                StatusCode::BAD_REQUEST,
+                "service_sans_ecriture",
+                format!("service '{service}' cannot create playlists"),
+            ));
+        }
+    }
+    Ok(arc)
+}
+
+#[derive(Deserialize)]
+struct ApercuAppariementBody {
+    /// Service visé ; `qobuz` par défaut (go de Bertrand du 14/10/2026 :
+    /// « Dans favoris radio, je veux pouvoir créer une playlist dans Qobuz »).
+    service: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Recherches menées en parallèle pendant l'aperçu. Quatre, comme les pages
+/// de recherche Qobuz (`MAX_CONCURRENT_PAGES`) : assez pour qu'un aperçu de
+/// deux cents favoris ne dure pas des minutes, assez peu pour ne pas se faire
+/// limiter par l'API.
+const RECHERCHES_APERCU_EN_PARALLELE: usize = 4;
+
+fn piste_apercu(t: &tune_core::streaming::traits::StreamTrack, score: f64) -> Value {
+    json!({
+        "id": t.id,
+        "title": t.title,
+        "artist": t.artist,
+        "album": t.album,
+        "cover_url": t.cover_path,
+        "duration_ms": t.duration_ms,
+        "score": score,
+    })
+}
+
+/// `POST /radio-favorites/match-preview` — chercher chaque favori radio chez
+/// le service et rendre la correspondance trouvée, SANS rien créer.
+///
+/// L'écran montre chaque ligne pour que l'utilisateur la valide ou l'écarte,
+/// puis rappelle `create-playlist` avec `track_ids` = les titres retenus.
+///
+/// Par favori : `status` (`matched`, `approximate`, `ambiguous`,
+/// `not_found`, `search_failed`), `match` (la correspondance retenue ou
+/// `null`), `alternatives` (les suivantes, classées) et `duplicate_of`
+/// (l'identifiant du favori précédent qui désigne déjà la même piste).
+async fn apercu_appariement_favoris(
+    State(state): State<AppState>,
+    body: Option<Json<ApercuAppariementBody>>,
+) -> Result<axum::response::Response, AppError> {
+    let (service, limit) = match body {
+        Some(Json(b)) => (
+            b.service.unwrap_or_else(|| "qobuz".into()),
+            b.limit.unwrap_or(200),
+        ),
+        None => ("qobuz".into(), 200),
+    };
+    let arc = match service_pour_playlist(&state, &service).await {
+        Ok(a) => a,
+        Err(r) => return Ok(r),
+    };
+
+    use tune_core::db::backend::ToSqlValue;
+    let limit_sql = limit as i64;
+    let favoris: Vec<(i64, String, String, String, Option<String>)> = state
+        .backend
+        .query_many(
+            "SELECT id, title, artist, station_name, cover_url FROM radio_favorites ORDER BY saved_at DESC LIMIT ?",
+            &[&limit_sql as &dyn ToSqlValue],
+        )
+        .map_err(AppError::internal)?
+        .into_iter()
+        .map(|r| {
+            (
+                r.first().and_then(|v| v.as_i64()).unwrap_or(0),
+                r.get(1).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.get(3).and_then(|v| v.as_string()).unwrap_or_default(),
+                r.get(4).and_then(|v| v.as_string()),
+            )
+        })
+        .collect();
+
+    let svc = arc.read().await;
+    let svc_ref: &dyn tune_core::streaming::traits::StreamingService = &**svc;
+    let service_ref = service.as_str();
+    let appariements: Vec<_> =
+        futures_util::stream::iter(favoris.iter().map(|(_, title, artist, _, _)| async move {
+            let (t, a) = scinder_titre_icy(title, artist);
+            apparier_favori_radio(svc_ref, service_ref, &t, &a).await
+        }))
+        .buffered(RECHERCHES_APERCU_EN_PARALLELE)
+        .collect()
+        .await;
+    drop(svc);
+
+    let mut deja: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut compte: std::collections::BTreeMap<&'static str, usize> =
+        std::collections::BTreeMap::new();
+    let mut items: Vec<Value> = Vec::with_capacity(favoris.len());
+    for ((id, title, artist, station, cover), a) in favoris.iter().zip(appariements) {
+        let statut = a.statut();
+        *compte.entry(statut.as_str()).or_default() += 1;
+        let duplicate_of = a
+            .meilleur
+            .as_ref()
+            .and_then(|(t, _)| match deja.get(&t.id) {
+                Some(premier) => Some(*premier),
+                None => {
+                    deja.insert(t.id.clone(), *id);
+                    None
+                }
+            });
+        items.push(json!({
+            "favorite_id": id,
+            "title": title,
+            "artist": artist,
+            "station_name": station,
+            "cover_url": cover,
+            "status": statut.as_str(),
+            "match": a.meilleur.as_ref().map(|(t, s)| piste_apercu(t, *s)),
+            "alternatives": a
+                .alternatives
+                .iter()
+                .map(|(t, s)| piste_apercu(t, *s))
+                .collect::<Vec<_>>(),
+            "duplicate_of": duplicate_of,
+        }));
+    }
+    tracing::info!(
+        service = %service,
+        favorites = favoris.len(),
+        counts = ?compte,
+        "radio_fav_match_preview_done"
+    );
+    let n = |k: &str| compte.get(k).copied().unwrap_or(0);
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "service": service,
+            "favorites_count": favoris.len(),
+            "matched": n("matched"),
+            "approximate": n("approximate"),
+            "ambiguous": n("ambiguous"),
+            "not_found": n("not_found"),
+            "search_failed": n("search_failed"),
+            "items": items,
+        })),
+    )
+        .into_response())
+}
+
+/// `create-playlist` avec `track_ids` : la playlist reçoit EXACTEMENT les
+/// titres validés à l'aperçu, sans nouvel appariement.
+async fn creer_playlist_depuis_titres_retenus(
+    state: &AppState,
+    service: Option<&str>,
+    name: &str,
+    track_ids: &[String],
+) -> Result<axum::response::Response, AppError> {
+    let service = service.unwrap_or("qobuz");
+    let erreur =
+        |code: StatusCode, err: &str| Ok((code, Json(json!({ "error": err }))).into_response());
+    if service == "local" {
+        // Les identifiants rendus par l'aperçu sont ceux d'un SERVICE : la
+        // bibliothèque locale garde la création « en un geste ».
+        return erreur(StatusCode::BAD_REQUEST, "track_ids_service_seulement");
+    }
+    if name.trim().is_empty() {
+        return erreur(StatusCode::BAD_REQUEST, "nom_vide");
+    }
+    if dedoublonner_titres(track_ids).is_empty() {
+        return erreur(StatusCode::BAD_REQUEST, "aucun_titre_retenu");
+    }
+    let arc = match service_pour_playlist(state, service).await {
+        Ok(a) => a,
+        Err(r) => return Ok(r),
+    };
+    let svc = arc.read().await;
+    match creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await {
+        Ok(p) => {
+            tracing::info!(
+                service = %service,
+                retenus = track_ids.len(),
+                ajoutes = p.ajoutes,
+                doublons = p.doublons,
+                ajout_en_echec = p.erreur_ajout.is_some(),
+                "radio_fav_playlist_from_selection_done"
+            );
+            Ok((
+                StatusCode::CREATED,
+                Json(json!({
+                    "service": service,
+                    "name": name.trim(),
+                    "playlist_id": p.playlist_id,
+                    "remote_playlist_id": p.playlist_id,
+                    "matched_tracks": p.ajoutes,
+                    "added": p.ajoutes,
+                    "duplicates_skipped": p.doublons,
+                    "add_error": p.erreur_ajout,
+                })),
+            )
+                .into_response())
+        }
+        Err(e) => {
+            tracing::warn!(service = %service, error = %e, "radio_fav_create_playlist_failed");
+            Ok((
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": format!("could not create playlist on '{service}': {e}"),
+                })),
+            )
+                .into_response())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

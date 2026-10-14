@@ -576,9 +576,20 @@ impl QobuzService {
     /// l'API Qobuz. Réservé aux essais : il n'existe aucun chemin de
     /// production qui construise un service ainsi.
     #[cfg(test)]
-    fn avec_base_forcee(base: impl Into<String>) -> Self {
+    pub(crate) fn avec_base_forcee(base: impl Into<String>) -> Self {
         let mut svc = Self::new(String::from("app-id-essai"), String::from("secret-essai"));
         svc.base_forcee = Some(base.into());
+        svc
+    }
+
+    /// Comme [`Self::avec_base_forcee`], avec un jeton utilisateur FACTICE :
+    /// le service se comporte comme un compte connecté, sans qu'aucun
+    /// identifiant réel n'entre dans un essai. Utilisé hors de ce module par
+    /// les essais des favoris radio → playlist Qobuz.
+    #[cfg(test)]
+    pub(crate) fn connecte_a_base_forcee(base: impl Into<String>) -> Self {
+        let mut svc = Self::avec_base_forcee(base);
+        svc.user_auth_token = Some(String::from("jeton-essai"));
         svc
     }
 
