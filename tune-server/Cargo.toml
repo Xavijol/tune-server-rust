@@ -1630,6 +1630,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
 
+# Favoris radio → playlist Qobuz : aperçu puis création des titres retenus.
+[[test]]
+name = "favoris_radio_playlist_qobuz"
+path = "tests/favoris_radio_playlist_qobuz.rs"
+
 # #5997 — les routes de favoris de service passent par le miroir du service.
 [[test]]
 name = "favoris_miroir_routes_5997"
