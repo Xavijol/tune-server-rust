@@ -370,6 +370,12 @@ path = "tests/ape_incremental_i2505.rs"
 name = "ape_pic_memoire_i2505"
 path = "tests/ape_pic_memoire_i2505.rs"
 
+# #6168 — seuil mmap de la glibc fixé au démarrage. Binaire à lui seul : il
+# se relance en processus fils, l'état de l'allocateur est global.
+[[test]]
+name = "seuil_mmap_glibc_6168"
+path = "tests/seuil_mmap_glibc_6168.rs"
+
 # #6168 — pic mémoire de l'import des playlists en fin de scan. Binaire à lui
 # seul : il pose un `#[global_allocator]` qui suit le pic d'octets vivants.
 [[test]]
