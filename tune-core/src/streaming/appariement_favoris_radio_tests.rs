@@ -119,7 +119,27 @@ async fn faux_qobuz(catalogue: Vec<Piste>, pannes: Pannes) -> (QobuzService, Jou
         }
     };
 
+    // La playlist existante 555 contient déjà 101 (La Bohème).
+    let j = journal.clone();
+    let lecture = move |Query(q): Query<HashMap<String, String>>| {
+        let j = j.clone();
+        async move {
+            let id = q.get("playlist_id").cloned().unwrap_or_default();
+            j.lock().unwrap().push(("/playlist/get".into(), id.clone()));
+            if id != "555" {
+                return (StatusCode::NOT_FOUND, "{\"status\":\"error\"}").into_response();
+            }
+            Json(json!({
+                "id": 555,
+                "name": "Ma playlist",
+                "tracks": {"items": [{"id": 101, "title": "La Bohème", "performer": {"name": "Charles Aznavour"}}], "total": 1, "limit": 50, "offset": 0}
+            }))
+            .into_response()
+        }
+    };
+
     let app = Router::new()
+        .route("/playlist/get", get(lecture))
         .route("/catalog/search", get(recherche))
         .route("/playlist/create", post(creation))
         .route("/playlist/addTracks", post(ajout));
@@ -230,14 +250,17 @@ async fn original_et_remaster_ne_font_pas_une_ambiguite() {
     // réédité, sans rien apprendre à l'auditeur.
     let (svc, _j) = faux_qobuz(catalogue(), SANS_PANNE).await;
     let a = apparier_favori_radio(&svc, "qobuz", "Heroes", "David Bowie").await;
+    let mut ids: Vec<&str> = a
+        .meilleur
+        .iter()
+        .chain(a.alternatives.iter())
+        .map(|(t, _)| t.id.as_str())
+        .collect();
+    ids.sort();
     assert_eq!(
-        a.meilleur.as_ref().map(|(t, _)| t.id.as_str()),
-        Some("104"),
-        "l'original exact passe devant la réédition : {a:?}"
-    );
-    assert!(
-        a.alternatives.iter().any(|(t, _)| t.id == "103"),
-        "la réédition reste proposée en alternative : {a:?}"
+        ids,
+        vec!["103", "104"],
+        "les deux éditions sont proposées, l'une retenue, l'autre en alternative : {a:?}"
     );
     assert_eq!(a.statut(), StatutAppariement::Matched, "{a:?}");
 }
@@ -363,4 +386,67 @@ async fn un_ajout_refuse_est_rendu_et_non_avale() {
     assert_eq!(r.playlist_id, "987654");
     assert_eq!(r.ajoutes, 0);
     assert!(r.erreur_ajout.is_some(), "{r:?}");
+}
+
+#[tokio::test]
+async fn ajout_a_une_playlist_existante_saute_les_titres_deja_presents() {
+    // Décision du 14/10 : un titre déjà dans la playlist cible n'y entre pas
+    // deux fois. 101 y est déjà ; seul 104 doit partir.
+    let (svc, j) = faux_qobuz(catalogue(), SANS_PANNE).await;
+    let ids: Vec<String> = ["101", "104", "104"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let r = ajouter_a_playlist_existante(&svc, "555", &ids)
+        .await
+        .expect("ajout");
+    assert_eq!(r.playlist_id, "555");
+    assert_eq!(r.ajoutes, 1, "{r:?}");
+    assert_eq!(r.deja_presents, 1, "{r:?}");
+    assert_eq!(r.doublons, 1, "{r:?}");
+    let journal = j.lock().unwrap().clone();
+    assert!(
+        journal.iter().all(|(c, _)| c != "/playlist/create"),
+        "aucune playlist ne doit être créée : {journal:?}"
+    );
+    let ajout = journal
+        .iter()
+        .find(|(c, _)| c == "/playlist/addTracks")
+        .expect("/playlist/addTracks appelé");
+    let champs = champs_de(&ajout.1);
+    assert_eq!(champs.get("playlist_id").map(String::as_str), Some("555"));
+    assert_eq!(
+        champs.get("track_ids").map(String::as_str),
+        Some("104"),
+        "101 est déjà dans la playlist cible : il ne doit pas être renvoyé"
+    );
+}
+
+#[tokio::test]
+async fn tout_deja_present_n_appelle_pas_qobuz_pour_rien() {
+    let (svc, j) = faux_qobuz(catalogue(), SANS_PANNE).await;
+    let r = ajouter_a_playlist_existante(&svc, "555", &["101".to_string()])
+        .await
+        .expect("ajout");
+    assert_eq!((r.ajoutes, r.deja_presents), (0, 1), "{r:?}");
+    assert!(
+        j.lock()
+            .unwrap()
+            .iter()
+            .all(|(c, _)| c != "/playlist/addTracks")
+    );
+}
+
+#[tokio::test]
+async fn playlist_cible_illisible_n_ajoute_rien() {
+    let (svc, j) = faux_qobuz(catalogue(), SANS_PANNE).await;
+    ajouter_a_playlist_existante(&svc, "999", &["104".to_string()])
+        .await
+        .expect_err("sans lire la cible, on ne sait pas éviter les doublons");
+    assert!(
+        j.lock()
+            .unwrap()
+            .iter()
+            .all(|(c, _)| c != "/playlist/addTracks")
+    );
 }

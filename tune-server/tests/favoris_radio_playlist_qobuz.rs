@@ -136,8 +136,13 @@ impl StreamingService for QobuzSimule {
     async fn get_playlist(&self, _id: &str) -> Result<StreamPlaylist, TuneError> {
         Err("hors sujet".into())
     }
-    async fn get_playlist_tracks(&self, _id: &str) -> Result<Vec<StreamTrack>, TuneError> {
-        Err("hors sujet".into())
+    /// La playlist existante « pl-existante » contient déjà « q-heroes ».
+    async fn get_playlist_tracks(&self, id: &str) -> Result<Vec<StreamTrack>, TuneError> {
+        if id == "pl-existante" {
+            Ok(vec![piste("q-heroes", "Heroes", "David Bowie")])
+        } else {
+            Err("playlist inconnue".into())
+        }
     }
     async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
@@ -360,4 +365,55 @@ async fn un_service_sans_ecriture_refuse_l_apercu() {
     assert_eq!(st, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"], "service_sans_ecriture");
     assert!(journal.lock().unwrap().recherches.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l_ajout_a_une_playlist_existante_ne_remet_pas_ce_qu_elle_contient() {
+    let (app, journal, _dir) = banc(true, true).await;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({
+            "service": "qobuz",
+            "target_playlist_id": "pl-existante",
+            "track_ids": ["q-heroes", "q-hal-jb"],
+        }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(body["playlist_id"], "pl-existante", "{body}");
+    assert_eq!(body["existing_playlist"], true, "{body}");
+    assert_eq!(body["added"], 1, "{body}");
+    assert_eq!(body["already_present"], 1, "{body}");
+    let j = journal.lock().unwrap();
+    assert!(
+        j.creations.is_empty(),
+        "aucune création : {:?}",
+        j.creations
+    );
+    assert_eq!(
+        j.ajouts,
+        vec![vec!["q-hal-jb".to_string()]],
+        "« q-heroes » est déjà dans la playlist cible : il ne repart pas"
+    );
+}
+
+/// La création « en un geste » d'avant (sans `track_ids`) passe désormais
+/// par `apparier_favori_radio` : elle doit toujours pousser les pistes sûres.
+#[tokio::test(flavor = "multi_thread")]
+async fn la_creation_en_un_geste_marche_toujours() {
+    let (app, journal, _dir) = banc(true, true).await;
+    let (st, body) = appel(
+        &app,
+        "/api/v1/radio-favorites/create-playlist",
+        json!({ "service": "qobuz", "playlist_name": "Un geste", "limit": 10 }),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{body}");
+    assert_eq!(body["favorites_count"], 4, "{body}");
+    assert_eq!(body["not_found"], 1, "{body}");
+    let j = journal.lock().unwrap();
+    assert_eq!(j.creations, vec!["Un geste".to_string()]);
+    let ajoutes = j.ajouts.concat();
+    assert!(ajoutes.contains(&"q-heroes".to_string()), "{ajoutes:?}");
 }

@@ -256,6 +256,9 @@ pub struct PlaylistCreee {
     pub ajoutes: usize,
     /// Doublons écartés avant l'envoi.
     pub doublons: usize,
+    /// Titres retenus DÉJÀ présents dans la playlist cible, donc non
+    /// rajoutés (ajout à une playlist existante ; toujours 0 à la création).
+    pub deja_presents: usize,
     /// L'ajout a échoué APRÈS la création : la playlist existe, vide ou
     /// partielle. Le motif est rendu, pas avalé.
     pub erreur_ajout: Option<String>,
@@ -293,6 +296,54 @@ pub async fn creer_playlist_avec_titres(
         playlist_id,
         ajoutes,
         doublons,
+        deja_presents: 0,
+        erreur_ajout,
+    })
+}
+
+/// Verser `track_ids` dans une playlist EXISTANTE du compte (décision de
+/// Bertrand du 14/10/2026 : « nouvelle playlist » ou une playlist Qobuz
+/// existante).
+///
+/// Les titres déjà présents dans la playlist cible ne sont pas ajoutés une
+/// seconde fois : on relit d'abord son contenu. Si cette lecture échoue, on
+/// n'ajoute RIEN (`Err`) — ajouter à l'aveugle créerait précisément les
+/// doublons que la règle interdit.
+pub async fn ajouter_a_playlist_existante(
+    svc: &dyn StreamingService,
+    playlist_id: &str,
+    track_ids: &[String],
+) -> Result<PlaylistCreee, String> {
+    let ids = dedoublonner_titres(track_ids);
+    let doublons = track_ids.len() - ids.len();
+    let presents: std::collections::HashSet<String> = svc
+        .get_playlist_tracks(playlist_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    let nouveaux: Vec<String> = ids
+        .into_iter()
+        .filter(|id| !presents.contains(id))
+        .collect();
+    let deja_presents = track_ids.len() - doublons - nouveaux.len();
+    let (ajoutes, erreur_ajout) = if nouveaux.is_empty() {
+        (0, None)
+    } else {
+        match svc.add_tracks_to_playlist(playlist_id, &nouveaux).await {
+            Ok(n) => (n, None),
+            Err(e) => {
+                tracing::warn!(error = %e, "radio_fav_add_tracks_failed");
+                (0, Some(e.to_string()))
+            }
+        }
+    };
+    Ok(PlaylistCreee {
+        playlist_id: playlist_id.to_string(),
+        ajoutes,
+        doublons,
+        deja_presents,
         erreur_ajout,
     })
 }

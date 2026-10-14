@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use tune_core::db::radio_repo::{RadioRepo, RadioStation};
 use tune_core::http::streamer::AudioStreamer;
 use tune_core::streaming::appariement_favoris_radio::{
-    apparier_favori_radio, creer_playlist_avec_titres, dedoublonner_titres, scinder_titre_icy,
+    ajouter_a_playlist_existante, apparier_favori_radio, creer_playlist_avec_titres,
+    dedoublonner_titres, scinder_titre_icy,
 };
 
 use crate::error::AppError;
@@ -2282,6 +2283,10 @@ struct CreatePlaylistFromFavBody {
     /// Présent : aucun nouvel appariement, la playlist reçoit exactement ces
     /// titres (dédoublonnés). Absent : la création « en un geste » d'avant.
     track_ids: Option<Vec<String>>,
+    /// Avec `track_ids` : une playlist EXISTANTE du compte où verser les
+    /// titres, au lieu d'en créer une (décision de Bertrand du 14/10/2026).
+    /// Les titres qu'elle contient déjà ne sont pas rajoutés.
+    target_playlist_id: Option<String>,
 }
 
 /// Les trois compteurs que l'écran « Favoris radio → Créer une playlist »
@@ -2359,8 +2364,14 @@ async fn create_playlist_from_favorites(
             .clone()
             .or(b.name.clone())
             .unwrap_or_else(|| "Radio Favorites".into());
-        return creer_playlist_depuis_titres_retenus(&state, b.service.as_deref(), &name, ids)
-            .await;
+        return creer_playlist_depuis_titres_retenus(
+            &state,
+            b.service.as_deref(),
+            &name,
+            b.target_playlist_id.as_deref(),
+            ids,
+        )
+        .await;
     }
 
     let (name, limit, service) = match body {
@@ -2585,7 +2596,7 @@ async fn create_streaming_playlist_from_favorites(
         // (`/radio-favorites/match-preview`) : les deux chemins désignent la
         // même piste. Ici, comme avant, une ambiguïté compte comme un match
         // sûr — seul l'aperçu sait la faire trancher.
-        let a = apparier_favori_radio(&*svc, service, title, artist).await;
+        let a = apparier_favori_radio(&**svc, service, title, artist).await;
         match a.meilleur {
             Some((t, score)) => {
                 let sure = score >= tune_core::streaming::matching::MATCH_ACCEPT_SCORE;
@@ -2794,10 +2805,19 @@ async fn apercu_appariement_favoris(
     let svc_ref: &dyn tune_core::streaming::traits::StreamingService = &**svc;
     let service_ref = service.as_str();
     let appariements: Vec<_> =
-        futures_util::stream::iter(favoris.iter().map(|(_, title, artist, _, _)| async move {
-            let (t, a) = scinder_titre_icy(title, artist);
-            apparier_favori_radio(svc_ref, service_ref, &t, &a).await
-        }))
+        // Des couples POSSÉDÉS, pas des `&` sur `favoris` : une fermeture qui
+        // rend un bloc async empruntant son argument n'est pas assez générale
+        // pour un gestionnaire axum (`FnOnce is not general enough`).
+        futures_util::stream::iter(
+            favoris
+                .iter()
+                .map(|(_, title, artist, _, _)| scinder_titre_icy(title, artist))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(move |(t, a)| async move {
+                    apparier_favori_radio(svc_ref, service_ref, &t, &a).await
+                }),
+        )
         .buffered(RECHERCHES_APERCU_EN_PARALLELE)
         .collect()
         .await;
@@ -2860,13 +2880,19 @@ async fn apercu_appariement_favoris(
 }
 
 /// `create-playlist` avec `track_ids` : la playlist reçoit EXACTEMENT les
-/// titres validés à l'aperçu, sans nouvel appariement.
+/// titres validés à l'aperçu, sans nouvel appariement — une nouvelle
+/// playlist, ou `target_playlist_id` (une playlist existante du compte, sans
+/// y remettre les titres qu'elle contient déjà).
 async fn creer_playlist_depuis_titres_retenus(
     state: &AppState,
     service: Option<&str>,
     name: &str,
+    target_playlist_id: Option<&str>,
     track_ids: &[String],
 ) -> Result<axum::response::Response, AppError> {
+    let cible = target_playlist_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
     let service = service.unwrap_or("qobuz");
     let erreur =
         |code: StatusCode, err: &str| Ok((code, Json(json!({ "error": err }))).into_response());
@@ -2875,7 +2901,7 @@ async fn creer_playlist_depuis_titres_retenus(
         // bibliothèque locale garde la création « en un geste ».
         return erreur(StatusCode::BAD_REQUEST, "track_ids_service_seulement");
     }
-    if name.trim().is_empty() {
+    if cible.is_none() && name.trim().is_empty() {
         return erreur(StatusCode::BAD_REQUEST, "nom_vide");
     }
     if dedoublonner_titres(track_ids).is_empty() {
@@ -2886,13 +2912,19 @@ async fn creer_playlist_depuis_titres_retenus(
         Err(r) => return Ok(r),
     };
     let svc = arc.read().await;
-    match creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await {
+    let verse = match cible {
+        Some(id) => ajouter_a_playlist_existante(&**svc, id, track_ids).await,
+        None => creer_playlist_avec_titres(&**svc, name.trim(), track_ids).await,
+    };
+    match verse {
         Ok(p) => {
             tracing::info!(
                 service = %service,
                 retenus = track_ids.len(),
                 ajoutes = p.ajoutes,
                 doublons = p.doublons,
+                deja_presents = p.deja_presents,
+                existante = cible.is_some(),
                 ajout_en_echec = p.erreur_ajout.is_some(),
                 "radio_fav_playlist_from_selection_done"
             );
@@ -2900,12 +2932,14 @@ async fn creer_playlist_depuis_titres_retenus(
                 StatusCode::CREATED,
                 Json(json!({
                     "service": service,
-                    "name": name.trim(),
+                    "name": if cible.is_some() { Value::Null } else { json!(name.trim()) },
                     "playlist_id": p.playlist_id,
                     "remote_playlist_id": p.playlist_id,
                     "matched_tracks": p.ajoutes,
                     "added": p.ajoutes,
                     "duplicates_skipped": p.doublons,
+                    "already_present": p.deja_presents,
+                    "existing_playlist": cible.is_some(),
                     "add_error": p.erreur_ajout,
                 })),
             )
@@ -2916,7 +2950,10 @@ async fn creer_playlist_depuis_titres_retenus(
             Ok((
                 StatusCode::BAD_GATEWAY,
                 Json(json!({
-                    "error": format!("could not create playlist on '{service}': {e}"),
+                    "error": match cible {
+                        Some(id) => format!("could not add to playlist '{id}' on '{service}': {e}"),
+                        None => format!("could not create playlist on '{service}': {e}"),
+                    },
                 })),
             )
                 .into_response())
