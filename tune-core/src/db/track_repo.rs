@@ -684,6 +684,20 @@ pub mod sql {
         )
     }
 
+    /// #6168 — une page des clés de l'import des playlists : les colonnes 0, 1,
+    /// 3 et 5 de [`select_track`], filtre de `list_all_local`, après
+    /// l'identifiant lié en 1, au plus autant de lignes que le 2.
+    pub fn cles_de_playlist_par_page<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "SELECT t.id, t.file_path, t.title, ar.name, al.title{} \
+             WHERE t.file_path IS NOT NULL AND t.file_path != '' AND t.id > {} \
+             ORDER BY t.id LIMIT {}",
+            track_from(),
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
     /// La piste virtuelle identifiée par sa tranche dans le fichier image.
     ///
     /// C'est l'identité que porte l'index unique partiel `idx_tracks_cue_identity`
@@ -1629,6 +1643,20 @@ impl InfoFichier {
 ///
 /// Rendue par [`TrackRepo::preuves_de_compilation`], une entrée par
 /// `file_path`.
+/// Une piste locale telle que l'import des playlists du scan la compare
+/// ([`TrackRepo::pour_chaque_cle_de_playlist`], #6168).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CleDePlaylist {
+    pub id: i64,
+    pub file_path: Option<String>,
+    pub title: String,
+    pub artist_name: Option<String>,
+    pub album_title: Option<String>,
+}
+
+/// Lignes lues par page dans [`TrackRepo::pour_chaque_cle_de_playlist`].
+pub const PAGE_DES_CLES_DE_PLAYLIST: i64 = 5_000;
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct PreuveDeCompilation {
     /// `tracks.album_artist` : la balise BRUTE, telle que le scan l'a lue.
@@ -4011,10 +4039,10 @@ impl TrackRepo {
     /// « Part I / Part II / Part III » deviendrait quinze fois le titre du
     /// disque.
     ///
-    /// L'autre consommateur, `library::playlist_scan`, y gagnerait (il
-    /// n'indexe que titre/interprète/album pour l'appariement approché des
-    /// `.m3u`) : c'est LUI qu'il faudra servir, par une sélection à part, sans
-    /// entraîner la relecture d'étiquettes avec.
+    /// L'autre consommateur, `library::playlist_scan`, n'indexe que
+    /// titre/interprète/album pour l'appariement approché des `.m3u` : il est
+    /// servi depuis #6168 par sa sélection à part,
+    /// [`TrackRepo::pour_chaque_cle_de_playlist`].
     pub fn list_all_local(&self) -> Result<Vec<Track>, TuneError> {
         let sql = format!(
             "{} WHERE t.file_path IS NOT NULL AND t.file_path != ''",
@@ -4022,6 +4050,56 @@ impl TrackRepo {
         );
         let rows = self.db.query_many(&sql, &[])?;
         Ok(rows.iter().map(row_to_track).collect())
+    }
+
+    /// #6168 — la sélection à part qu'annonçait le commentaire ci-dessus :
+    /// les seules colonnes que `library::playlist_scan` compare (identifiant,
+    /// chemin, titre, interprète, album), lues PAR PAGES de
+    /// [`PAGE_DES_CLES_DE_PLAYLIST`] dans l'ordre des identifiants.
+    ///
+    /// `list_all_local` gardait en mémoire, en même temps, les 35 colonnes de
+    /// chaque ligne lue PUIS la `Track` complète de chaque piste. Mesuré sur
+    /// Shrek, bibliothèque synthétique de 121 000 pistes : le pic du scan passait
+    /// de 330 à 885 Mo en quatre secondes, à la fin du scan, au seul profit de
+    /// cet index — soit près de 3 Go pour les 611 905 pistes du fil 2231. Ici,
+    /// rien ne vit au-delà d'une page : la mémoire tenue est celle de l'index
+    /// que l'appelant construit.
+    ///
+    /// Mêmes lignes et mêmes valeurs que `list_all_local` (mêmes jointures,
+    /// même filtre ; titre vide si NULL, comme `row_to_track`).
+    pub fn pour_chaque_cle_de_playlist(
+        &self,
+        mut visiter: impl FnMut(CleDePlaylist),
+    ) -> Result<usize, TuneError> {
+        let sql = self.dialect_sql(
+            sql::cles_de_playlist_par_page,
+            sql::cles_de_playlist_par_page,
+        );
+        let limite = PAGE_DES_CLES_DE_PLAYLIST;
+        let mut apres = 0i64;
+        let mut vues = 0usize;
+        loop {
+            let params: [&dyn ToSqlValue; 2] = [&apres, &limite];
+            let rows = self.db.query_many(&sql, &params)?;
+            let n = rows.len();
+            for cols in rows {
+                let Some(id) = cols.first().and_then(|v| v.as_i64()) else {
+                    continue;
+                };
+                apres = apres.max(id);
+                vues += 1;
+                visiter(CleDePlaylist {
+                    id,
+                    file_path: cols.get(1).and_then(|v| v.as_string()),
+                    title: cols.get(2).and_then(|v| v.as_string()).unwrap_or_default(),
+                    artist_name: cols.get(3).and_then(|v| v.as_string()),
+                    album_title: cols.get(4).and_then(|v| v.as_string()),
+                });
+            }
+            if (n as i64) < limite {
+                return Ok(vues);
+            }
+        }
     }
 
     pub fn get_existing_audio_hash_album_pairs(&self) -> Result<HashSet<(String, i64)>, TuneError> {
