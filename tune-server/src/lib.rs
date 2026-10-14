@@ -74,6 +74,9 @@ mod tune_os_password;
 pub mod windows_migrate;
 
 #[cfg(test)]
+mod pauses_de_fond_tests;
+
+#[cfg(test)]
 mod aleatoire_selection_5526_tests;
 // #5512 : compilé partout, actif seulement en build de test (lib ET
 // intégration) — voir `isolement_disque_tests_5467::actif`.
