@@ -41,6 +41,9 @@ pub mod gain_approche;
 /// #2713 — la crête vraie versionnée, et le rattrapage des crêtes mesurées
 /// par l'ancien algorithme.
 pub mod rattrapage_crete;
+/// #6330 — « Tout relancer » rend à la cascade les pistes en échec, et la
+/// réveille si elle dort au repos.
+pub mod reessai;
 /// Refaire, sur demande, les mesures prises avant le correctif du vrai pic
 /// (#5882) : la campagne qui les rend à la passe, par lots.
 pub mod remesure;
@@ -1126,7 +1129,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>) {
                     &mut dernier_repos,
                     etat.motif_de_repos(),
                 );
-                tokio::time::sleep(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
+                // #6330 — « Tout relancer » écourte ce repos : des pistes
+                // rendues à la passe n'attendent pas un quart d'heure.
+                reessai::dormir_au_repos(std::time::Duration::from_secs(IDLE_SLEEP_SECS)).await;
             } else {
                 // More to do — loop again promptly.
                 tokio::time::sleep(pause_entre_deux_tours(&backend)).await;
