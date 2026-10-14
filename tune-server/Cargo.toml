@@ -248,6 +248,14 @@ path = "tests/dr_liste_albums_4521.rs"
 name = "reprise_des_passes_5469"
 path = "tests/reprise_des_passes_5469.rs"
 
+# #6330 / #6282 — « Tout relancer » reprend tout et rend les pistes en échec ;
+# un enrichissement garé se dit en pause. Les pauses sont un état global du
+# processus : cible à part. `autotests = false` : sans cette entrée, jamais
+# compilé.
+[[test]]
+name = "tout_relancer_et_etat_reel_6330_6282"
+path = "tests/tout_relancer_et_etat_reel_6330_6282.rs"
+
 # #5512 — les tests d'intégration n'écrivent plus `artwork_cache/`,
 # `queue_state/` ni `tune-scan-report.json` dans l'arbre. `autotests = false`
 # plus haut : sans cette cible, le témoin ne serait jamais compilé.
@@ -1621,6 +1629,11 @@ path = "tests/pg_compilation_reprise_5837.rs"
 [[test]]
 name = "favori_marquage_ia_5530"
 path = "tests/favori_marquage_ia_5530.rs"
+
+# Favoris radio → playlist Qobuz : aperçu puis création des titres retenus.
+[[test]]
+name = "favoris_radio_playlist_qobuz"
+path = "tests/favoris_radio_playlist_qobuz.rs"
 
 # #5997 — les routes de favoris de service passent par le miroir du service.
 [[test]]
