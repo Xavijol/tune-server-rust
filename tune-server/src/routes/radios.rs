@@ -2081,7 +2081,33 @@ pub fn radio_favorites_router() -> Router<AppState> {
         .route("/is-favorite", get(is_radio_favorite))
         .route("/save-current", post(save_current_as_favorite))
         .route("/create-playlist", post(create_playlist_from_favorites))
+        .route("/export", get(export_radio_favorites_csv))
         .route("/{fav_id}", axum::routing::delete(delete_radio_favorite))
+}
+
+/// GET /radio-favorites/export — le bouton « Exporter en CSV » de l'onglet
+/// Radio des favoris (un `<a href download>` côté web).
+///
+/// Sans cette route, le GET tombait sur `/{fav_id}`, qui n'accepte que
+/// DELETE : 405 au corps vide, que le navigateur enregistrait tel quel sous
+/// `radio_favorites.csv` — le fichier vide signalé le 14/10.
+async fn export_radio_favorites_csv(State(state): State<AppState>) -> Response {
+    let repo = tune_core::radio_favorites::RadioFavoriteRepo::with_backend(state.backend.clone());
+    match repo.export_csv() {
+        Ok(csv) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"radio_favorites.csv\"",
+                ),
+            ],
+            csv,
+        )
+            .into_response(),
+        Err(e) => AppError::internal(e).into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3192,6 +3218,10 @@ mod tests {
         panic!("la session {stream_id} survit au corps HTTP abandonné");
     }
 }
+
+#[cfg(test)]
+#[path = "export_csv_favoris_radio_tests.rs"]
+mod export_csv_favoris_radio_tests;
 
 #[cfg(test)]
 mod tests_validation_url_flux {
