@@ -531,7 +531,9 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
     let ext = canonical_cache_ext(ext);
     let filename = format!("{hash}.{ext}");
     let path = cache_dir.join(&filename);
-    if let Err(e) = std::fs::write(&path, data) {
+    if let Err(e) =
+        ecrire_image_atomiquement(&path, |fichier| std::io::Write::write_all(fichier, data))
+    {
         ARTWORK_CACHE_WRITE_FAILURES.fetch_add(1, Ordering::Relaxed);
         warn!(
             path = %path.display(),
@@ -542,6 +544,18 @@ pub fn save_to_cache(data: &[u8], cache_dir: &Path, hash: &str, ext: &str) -> Op
         return None;
     }
     Some(path)
+}
+
+/// Un lecteur voit l'ancienne image complète ou la nouvelle, jamais une
+/// troncature intermédiaire. Le temporaire est nettoyé aussi en cas d'erreur.
+fn ecrire_image_atomiquement(
+    path: &Path,
+    ecrire: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let mut temporaire = tempfile::NamedTempFile::new_in(path.parent().unwrap())?;
+    ecrire(temporaire.as_file_mut())?;
+    temporaire.persist(path).map_err(|erreur| erreur.error)?;
+    Ok(())
 }
 
 /// Compute a deterministic hash for an artwork cache key.
@@ -2595,6 +2609,59 @@ mod tests {
     // rendaient « terminé, 0 enrichi », et le ticket s'est arrêté là faute de
     // pouvoir départager (« aucun element pour l affirmer ni pour l ecarter »).
     // ---------------------------------------------------------------------
+
+    #[test]
+    fn une_reecriture_ne_tronque_pas_l_image_lue_6351() {
+        use std::io::Write;
+        use std::sync::mpsc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = b"image complete";
+        let path = save_to_cache(image, dir.path(), "image", "png").unwrap();
+        let destination = path.clone();
+        let (commence_tx, commence_rx) = mpsc::channel();
+        let (finir_tx, finir_rx) = mpsc::channel();
+        let tache = std::thread::spawn(move || {
+            ecrire_image_atomiquement(&destination, |fichier| {
+                fichier.write_all(b"image")?;
+                commence_tx.send(()).unwrap();
+                finir_rx.recv().unwrap();
+                fichier.write_all(b" complete")
+            })
+        });
+        commence_rx.recv().unwrap();
+        let pendant = std::fs::read(&path);
+        finir_tx.send(()).unwrap();
+        tache.join().unwrap().unwrap();
+        assert_eq!(
+            pendant.unwrap(),
+            image,
+            "image partielle visible pendant la réécriture"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn une_ecriture_interrompue_conserve_l_image_complete_6351() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = b"image complete";
+        let path = save_to_cache(image, dir.path(), "image", "png").unwrap();
+        let erreur = ecrire_image_atomiquement(&path, |fichier| {
+            fichier.write_all(b"image")?;
+            Err(std::io::Error::other("écriture interrompue pour le témoin"))
+        })
+        .unwrap_err();
+        assert_eq!(erreur.to_string(), "écriture interrompue pour le témoin");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            image,
+            "une erreur a détruit l'image complète"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     /// Le témoin, sur le fait de base : répertoire inscriptible, le fichier
     /// d'image existe après le passage et il n'est pas vide. Vert des deux
