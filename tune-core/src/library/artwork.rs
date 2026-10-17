@@ -1211,9 +1211,7 @@ async fn image_depuis_un_membre(
     }
     for membre in membres {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-        let mbid = search_musicbrainz_artist(&membre)
-            .await
-            .unwrap_or_default();
+        let mbid = search_musicbrainz_artist(&membre).await.unwrap_or_default();
         if let Some(bytes) =
             fetch_artist_image(&mbid, &membre, discogs_token, lastfm_key, refusees).await
         {
@@ -1613,10 +1611,7 @@ fn deezer_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> 
         .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
 }
 
-async fn fetch_artist_image_deezer(
-    client: &reqwest::Client,
-    artist_name: &str,
-) -> Option<Vec<u8>> {
+async fn fetch_artist_image_deezer(client: &reqwest::Client, artist_name: &str) -> Option<Vec<u8>> {
     let url = format!(
         "https://api.deezer.com/search/artist?q={}",
         urlencoding::encode(artist_name)

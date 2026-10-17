@@ -425,7 +425,9 @@ const ENSEMBLE_MARKERS: &[&str] = &[
 
 fn est_ensemble(name: &str) -> bool {
     let folded = fold_diacritics(name).to_lowercase();
-    ENSEMBLE_MARKERS.iter().any(|marker| folded.contains(marker))
+    ENSEMBLE_MARKERS
+        .iter()
+        .any(|marker| folded.contains(marker))
 }
 
 /// Who to illustrate when the stored artist is a concatenated credit.
