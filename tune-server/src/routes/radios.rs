@@ -1575,6 +1575,8 @@ pub(crate) async fn jouer_un_flux(
     url: &str,
     logo_url: Option<String>,
 ) -> Value {
+    // #6465 — une station n'appartient à aucun album ni playlist joué avant.
+    state.playback.effacer_contexte_de_session(zone_id).await;
     let play_req = tune_core::orchestrator::PlayRequest {
         zone_id,
         output_device_id: None,
