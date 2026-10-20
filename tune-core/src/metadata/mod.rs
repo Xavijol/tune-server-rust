@@ -84,6 +84,12 @@ pub struct TrackMetadata {
     pub album: Option<String>,
     pub album_artist: Option<String>,
     pub album_artist_sort: Option<String>,
+    /// tune-server-rust#6474 — le nom de TRI de l'interprète de la piste
+    /// (ARTISTSORT Vorbis/APE, `TSOP` ID3v2, `soar` MP4) : « Davis, Miles ».
+    /// Il remplit `artists.sort_name` de l'artiste de la piste quand le
+    /// fichier le porte, comme ALBUMARTISTSORT celui de l'artiste d'album.
+    #[serde(default)]
+    pub artist_sort: Option<String>,
     pub track_number: Option<u32>,
     pub disc_number: Option<u32>,
     pub total_tracks: Option<u32>,
@@ -285,6 +291,7 @@ impl TrackMetadata {
             &mut self.album_artist_sort,
             &mut corrections,
         );
+        sanitize_option("artist_sort", &mut self.artist_sort, &mut corrections);
         sanitize_option("disc_subtitle", &mut self.disc_subtitle, &mut corrections);
         sanitize_option("release_date", &mut self.release_date, &mut corrections);
         sanitize_option("original_date", &mut self.original_date, &mut corrections);
@@ -2105,12 +2112,19 @@ fn dsf_dff_fallback_complete(
     let mb_release_secondary_types =
         mb_type_brut.and_then(|v| release_type::colonne_des_secondaires([v]));
 
+    // #6474 — le nom de tri de l'interprète (`TSOP`), hors du tuple commun.
+    let artist_sort = id3_tags
+        .as_ref()
+        .and_then(|t| t.get("TSOP"))
+        .map(str::to_string);
+
     Some(TrackMetadata {
         title,
         album,
         artist,
         album_artist,
         album_artist_sort,
+        artist_sort,
         track_number,
         disc_number,
         total_tracks,
@@ -2196,6 +2210,7 @@ fn m4a_fallback(path: &Path) -> Option<TrackMetadata> {
         // l'artiste réel du dossier.
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -2625,6 +2640,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         // n'est pas un artiste d'album (#1656, #3232).
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -2733,6 +2749,7 @@ fn matroska_metadata(path: &Path) -> Result<TrackMetadata, String> {
         // (#1656, #3232) : seule la balise le renseigne.
         album_artist: balises.album_artist,
         album_artist_sort: None,
+        artist_sort: None,
         track_number: balises.track_number.or(numero_du_nom),
         // 🔴 #4471 — le DOSSIER tranche : voir `disque_arbitre`.
         disc_number: disque_arbitre(balises.disc_number, disque_du_chemin),
@@ -2811,6 +2828,7 @@ pub fn tagless_fallback_no_props(path: &Path) -> TrackMetadata {
         // `TrackMetadata::artist_from_path`.
         album_artist: None,
         album_artist_sort: None,
+        artist_sort: None,
         track_number,
         disc_number,
         total_tracks: None,
@@ -3650,6 +3668,8 @@ mod date_de_sortie_tests_2206;
 #[cfg(test)]
 mod interprete_tests_6232;
 #[cfg(test)]
+mod nom_de_tri_tests_6474;
+#[cfg(test)]
 mod type_de_sortie_tests_5616;
 
 /// Les balises d'un fichier, lues par lofty sans charger les images.
@@ -3941,6 +3961,7 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
         album,
         album_artist: get(ItemKey::AlbumArtist).or_else(|| raw_vorbis_field(path, "album_artist")),
         album_artist_sort: get(ItemKey::AlbumArtistSortOrder),
+        artist_sort: get(ItemKey::TrackArtistSortOrder),
         track_number,
         disc_number,
         total_tracks,
