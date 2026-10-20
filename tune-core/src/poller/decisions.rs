@@ -1030,6 +1030,47 @@ pub fn should_arm_gapless(
         && position_ms >= effective_duration_ms - GAPLESS_WINDOW_MS
 }
 
+/// #6477 — au-delà de ce délai entre l'armement (`SetNext`) et la retombée
+/// de position, l'enchaînement n'est pas « dès le `SetNext` ».
+pub const COUPE_AU_SETNEXT_DELAI_MAX_MS: u64 = 10_000;
+/// #6477 — en deçà de ce reste de piste au moment de la retombée, c'est une
+/// fin de piste ordinaire, pas une coupure.
+pub const COUPE_AU_SETNEXT_RESTE_MIN_MS: u64 = 10_000;
+
+/// #6477 (FiiO K17, fil 2323) — le renderer a-t-il LÂCHÉ la piste en cours
+/// dès le `SetNextAVTransportURI` ? Trois mesures indépendantes doivent
+/// concorder :
+///
+/// - la position est retombée moins de [`COUPE_AU_SETNEXT_DELAI_MAX_MS`]
+///   après l'armement (une fin ordinaire arrive ~30 s après, au bout de la
+///   fenêtre) ;
+/// - il restait au moins [`COUPE_AU_SETNEXT_RESTE_MIN_MS`] de piste au
+///   dernier sondage (un armement tardif suivi d'une fin ordinaire ne laisse
+///   que quelques secondes) ;
+/// - le flux de la piste n'a été tiré qu'EN PARTIE (`0 < servis < total`) :
+///   le renderer a abandonné sa connexion avant la fin du fichier. Un
+///   renderer qui va au bout a tout tiré ; un flux sans mesure ne prouve rien.
+///
+/// `arm_to_advance_ms` vaut `None` sans armement. Journal du K17 : armement
+/// à 374 s sur 404,7 s, retombée 1,87 s plus tard, 79,9 Mo servis sur
+/// 84,3 Mo, 30 s de musique perdues, deux pistes de suite.
+pub fn set_next_a_coupe_la_piste(
+    arm_to_advance_ms: Option<u64>,
+    prev_position_ms: u64,
+    track_duration_ms: u64,
+    servis: Option<u64>,
+    total: Option<u64>,
+) -> bool {
+    let (Some(delai_ms), Some(servis), Some(total)) = (arm_to_advance_ms, servis, total) else {
+        return false;
+    };
+    track_duration_ms > 0
+        && delai_ms <= COUPE_AU_SETNEXT_DELAI_MAX_MS
+        && track_duration_ms.saturating_sub(prev_position_ms) >= COUPE_AU_SETNEXT_RESTE_MIN_MS
+        && servis > 0
+        && servis < total
+}
+
 /// #5970 — marge laissée, après la résolution de la suivante, pour attendre
 /// ses premiers octets (`wait_stream_data_ready`, 5 s au plus) et poser le
 /// `SetNextAVTransportURI` avant la fin de la piste en cours.
@@ -1264,6 +1305,16 @@ pub fn deviceless_radio_refresh_due(
     is_playing && source == Some("radio") && radio_poll_due(since_last_poll, interval_secs)
 }
 
+/// Faut-il relire le titre d'une radio sur le relais radio-metadata (#6516) ?
+///
+/// La zone joue, la source est une radio, et le relais a servi son dernier
+/// titre il y a au moins une période (`zone_a_relire`). Une zone dont le
+/// titre vient du diffuseur ou de l'ICY n'est jamais « à relire » : elle
+/// garde le rythme du sondeur.
+pub fn relais_radio_du(is_playing: bool, source: Option<&str>, zone_a_relire: bool) -> bool {
+    is_playing && source == Some("radio") && zone_a_relire
+}
+
 /// Une lecture sans destination doit-elle cesser d'être annoncée ?
 ///
 /// Une zone sans périphérique de sortie prépare son flux, renonce à
@@ -1286,7 +1337,8 @@ pub fn deviceless_radio_refresh_due(
 /// - le démarrage est daté (`last_play_started_at` est `#[serde(skip)]` :
 ///   après une restauration d'état il vaut `None`, et on ne conclut rien),
 ///   et il remonte à plus que [`DELAI_SILENCE_ETABLI`] ;
-/// - le streamer CONNAÎT ce flux et déclare `0` octet servi. `None`
+/// - le streamer CONNAÎT ce flux et n'en a servi au plus qu'une sonde
+///   ([`super::TAILLE_MAXIMALE_D_UNE_SONDE`], #6066). `None`
 ///   (session inconnue, disparue, requête en échec) n'est pas une preuve
 ///   de silence : on laisse la lecture tranquille.
 ///
@@ -1296,8 +1348,10 @@ pub fn lecture_sans_destination_abandonnee(
     depuis_le_demarrage: Option<std::time::Duration>,
     octets_servis: Option<u64>,
 ) -> bool {
+    // #6066 — une sonde de plage (AVPlayer : deux octets, puis le refus) ne
+    // fait pas une destination : la lecture reste sans auditeur.
     depuis_le_demarrage.is_some_and(|d| d >= super::DELAI_SILENCE_ETABLI)
-        && octets_servis == Some(0)
+        && octets_servis.is_some_and(|n| !super::octets_d_une_ecoute(n))
 }
 
 /// L'autoplay doit-il chercher DANS LE SERVICE de la piste en cours ?

@@ -213,6 +213,41 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             corps BYTEA NOT NULL,\
             fetched_at TEXT NOT NULL\
         )",
+    // Enrichissement MetaRust, lot 1 (#4805). Même régime que la ligne
+    // ci-dessus : toute base PostgreSQL, à chaque démarrage ; `PG_FULL_SCHEMA`
+    // les porte aussi, à l'identique.
+    "CREATE TABLE IF NOT EXISTS album_completude (\
+            album_id BIGINT PRIMARY KEY,\
+            release_mbid TEXT NOT NULL,\
+            attendues INTEGER NOT NULL,\
+            presentes INTEGER NOT NULL,\
+            manquantes INTEGER NOT NULL,\
+            doublons INTEGER NOT NULL,\
+            detail TEXT NOT NULL,\
+            calcule_le TEXT NOT NULL\
+        )",
+    "CREATE TABLE IF NOT EXISTS artiste_instruments (\
+            artist_mbid TEXT PRIMARY KEY,\
+            qid TEXT,\
+            instruments TEXT NOT NULL,\
+            lu_le TEXT NOT NULL\
+        )",
+    "CREATE TABLE IF NOT EXISTS propositions_discogs (\
+            album_id BIGINT NOT NULL,\
+            discogs_release_id BIGINT NOT NULL,\
+            methode TEXT NOT NULL,\
+            proposition TEXT NOT NULL,\
+            statut TEXT NOT NULL,\
+            cree_le TEXT NOT NULL,\
+            decide_le TEXT,\
+            PRIMARY KEY (album_id, discogs_release_id)\
+        )",
+    "CREATE TABLE IF NOT EXISTS bpm_estimes (\
+            file_path TEXT PRIMARY KEY,\
+            bpm DOUBLE PRECISION NOT NULL,\
+            source TEXT NOT NULL,\
+            mesure_le TEXT NOT NULL\
+        )",
 ];
 
 // Every column SQLite gains via `add_column_if_missing` that the
@@ -328,6 +363,11 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // l'INSERT et l'UPDATE des pistes la NOMMENT. Sans effet sur une colonne
     // déjà là, TEXT de bascule comprise : c'est la 088 qui la convertit.
     "ALTER TABLE tracks ADD COLUMN IF NOT EXISTS rating BIGINT",
+    // #6516 — le lien des radios avec l'annuaire (PG 090). Ici AUSSI : une
+    // base de bascule ne rejoue pas la 090, et le rapprochement NOMME la
+    // colonne. L'index JUSTE APRÈS la colonne.
+    "ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS external_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)",
     // Fil 2121 — référence d'album d'une piste de service (PG 078). Ici AUSSI,
     // même raison : une base de bascule ne rejouera jamais la 078, alors que
     // l'écriture de la file, des favoris et de l'historique nomme la colonne.

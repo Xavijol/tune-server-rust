@@ -6,7 +6,7 @@ license.workspace = true
 autotests = false
 
 [features]
-default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio"]
+default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", "circle", "entree-audio", "assistant-ia"]
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture"]
@@ -75,6 +75,12 @@ circle = ["dep:tune-circle"]
 # l'exécution (`default_enabled = false`), au catalogue depuis #5296 (la
 # rubrique Sources du client web le consomme, #5065).
 entree-audio = ["dep:tune-entree-audio"]
+# Assistant IA, étape 1 (chantier assistant-ia) : playlists par phrase et
+# suggestions d'album, avec la clé de l'UTILISATEUR. Gratuit, dans `default`
+# et chargé par défaut (`default_enabled`) : rien ne part tant qu'aucun
+# fournisseur n'est réglé. Inscrit à `sdk/plugins.json`, d'où les lignes de
+# build et de test des workflows sont générées.
+assistant-ia = ["dep:tune-assistant-ia"]
 
 [dependencies]
 tune-plugin-native = { path = "../sdk/tune-plugin-native" }
@@ -101,6 +107,7 @@ tune-circle = { path = "../plugins/tune-circle", optional = true }
 tune-entree-audio = { path = "../plugins/tune-entree-audio", optional = true }
 tune-concerts = { path = "../plugins/tune-concerts", optional = true }
 tune-pont-roon = { path = "../plugins/tune-pont-roon", optional = true }
+tune-assistant-ia = { path = "../plugins/tune-assistant-ia", optional = true }
 tokio = { workspace = true }
 rayon = { workspace = true }
 axum = { workspace = true }
@@ -190,6 +197,8 @@ tokio = { workspace = true, features = ["test-util"] }
 tune-core = { path = "../tune-core", default-features = false, features = [
     "journal-de-test",
     "isolement-disque-de-test",
+    # #6336 : services remplaçables en test (tests/services_remplacables_6336.rs).
+    "services-factices",
 ] }
 
 # Purge à froid de la mémoire libre gardée par la glibc : binaire à part, le
@@ -209,6 +218,12 @@ path = "tests/sendspin_point_d_acces_s2a.rs"
 [[test]]
 name = "pont_lien_d_acces"
 path = "tests/pont_lien_d_acces.rs"
+
+# Le pont se pilote en administrateur ; renouvellement du lien d'accès.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "pont_administration"
+path = "tests/pont_administration.rs"
 
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
@@ -411,6 +426,10 @@ name = "plafonds_indexation_upnp_4154"
 path = "tests/plafonds_indexation_upnp_4154.rs"
 
 [[test]]
+name = "radios_upnp_hors_des_pistes_6500"
+path = "tests/radios_upnp_hors_des_pistes_6500.rs"
+
+[[test]]
 name = "plugin_contracts"
 path = "tests/plugin_contracts.rs"
 
@@ -610,6 +629,20 @@ path = "tests/compilation_le_tag_fait_foi.rs"
 [[test]]
 name = "ambiance_traduction_annoncee_3839"
 path = "tests/ambiance_traduction_annoncee_3839.rs"
+
+# Chantier « Assistant IA », étape 2 : l'ancien `/ai/query` passe par le coffre
+# et le plafond du greffon (sans appel réseau : plafond à zéro).
+[[test]]
+name = "assistant_ia_ancien_assistant_etape2"
+path = "tests/assistant_ia_ancien_assistant_etape2.rs"
+required-features = ["assistant-ia"]
+
+# Chantier « Assistant IA » : `/ai/query` rend le coût exact de la question
+# (`cout_eur`), par la route montée contre un faux fournisseur local.
+[[test]]
+name = "assistant_ia_cout_exact"
+path = "tests/assistant_ia_cout_exact.rs"
+required-features = ["assistant-ia"]
 
 # #3101 : la portée de répertoire de l'audit de bibliothèque. Le motif LIKE de
 # `GET /export/library-audit.csv?dir=…` était écrit à la main, sans séparateur :
@@ -844,6 +877,13 @@ path = "tests/radio_ajout_web_sans_doublon_3543.rs"
 name = "radios_recherche_distinction"
 path = "tests/radios_recherche_distinction.rs"
 
+# #6516 — annuaire radio-metadata.fr : cache local (ETag, hors ligne),
+# rapprochement de « Mes radios », ajout sans doublon. `autotests = false` :
+# sans cette inscription, le témoin ne serait jamais compilé.
+[[test]]
+name = "radios_annuaire_6516"
+path = "tests/radios_annuaire_6516.rs"
+
 # #3383 : la bascule « désactiver la télémétrie » n'éteignait rien — la route
 # n'écrivait pas, et les sept gardes d'envoi ne lisaient que `TUNE_TELEMETRY`.
 # Le témoin passe par les ROUTES MONTÉES puis appelle les décisions de
@@ -962,6 +1002,11 @@ path = "tests/plus_comme_ca_qobuz_fil1906.rs"
 [[test]]
 name = "radio_artiste_5395"
 path = "tests/radio_artiste_5395.rs"
+# #6465 — radio, podcast et préréglage effacent le contexte de session laissé
+# par l'album joué avant (Historique, vignette « en cours »).
+[[test]]
+name = "contexte_de_session_6465"
+path = "tests/contexte_de_session_6465.rs"
 # #2816 — la garde qui detecte la DERIVE des garde-fous : un fichier d'essais
 # que le compilateur n'atteint plus, un temoin qui ne s'execute plus que sous
 # une variable d'environnement que plus aucune etape ne pose. `autotests =
@@ -1666,3 +1711,11 @@ path = "tests/playlist_manager_alias_deprecies.rs"
 name = "pg_balises_6124"
 path = "tests/pg_balises_6124.rs"
 required-features = ["postgres"]
+
+# #6336 — AirPlay 2, SMB, Qobuz, TIDAL et Deezer éprouvés par le vrai routeur
+# contre des faux locaux. Binaire à lui seul : les substitutions de programmes
+# (`tune_core::services_factices`) sont un état de PROCESSUS. `autotests =
+# false` plus haut : sans cette cible, le banc ne serait JAMAIS compilé.
+[[test]]
+name = "services_remplacables_6336"
+path = "tests/services_remplacables_6336.rs"

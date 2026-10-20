@@ -2130,6 +2130,9 @@ impl PlaybackOrchestrator {
                     local_output.set_strict_bitperfect(
                         crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id),
                     );
+                    // #6522, #6524 — ce que PURE contourne, lu dans les
+                    // réglages : la chaîne posée plus bas sera vide en PURE.
+                    self.poser_ce_que_pure_contourne(zone_id, local_output);
                     // ReplayGain, applied by the output itself for a local DAC.
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be
@@ -2168,6 +2171,9 @@ impl PlaybackOrchestrator {
                     // Built at the resolved stream's rate/channel count so the
                     // biquads match the DAC clock, mirroring the crossfeed.
                     let eq_ch = media.channels.unwrap_or(2).clamp(1, 8) as u16;
+                    // #6211 — une radio n'a pas de piste suivante : le
+                    // préampli gardé d'un égaliseur coupé s'y éteint en fondu.
+                    local_output.set_flux_sans_fin(media.live_stream);
                     local_output.set_eq(self.load_eq_processor(zone_id, cf_sr, eq_ch));
                     // Repli mono (#2362) — sortie LOCALE uniquement, comme le
                     // crossfeed juste au-dessus. `zone_mono_downmix` rend
@@ -2419,6 +2425,22 @@ impl PlaybackOrchestrator {
             Some(ref sid) => self.streamer.is_seekable_session(sid).await,
             None => false,
         };
+        // #6370 — une sortie d'agent vient de recevoir un flux DÉCODÉ qui
+        // commence à la position : elle doit le savoir pour rapporter la
+        // position dans la piste, et non depuis le début du flux neuf. C'est
+        // le contrat de `LocalOutput::seek` (« noter la position d'un flux
+        // relancé ») ; `SortieAgentTune::seek` le tient chez le maître.
+        if output_type == Some(TYPE_SORTIE_AGENT_TUNE)
+            && !session_is_range_seekable
+            && position_ms > 0
+        {
+            if let Some(output) = { self.outputs.lock().await.get(did) }
+                && let Err(e) = output.lock().await.seek(position_ms).await
+            {
+                warn!(zone_id, position_ms, error = %e, "agent_depart_du_flux_non_note");
+            }
+            return;
+        }
         if !replay_needs_output_seek(
             is_network_output_type(output_type),
             session_is_range_seekable,
@@ -3067,6 +3089,25 @@ impl PlaybackOrchestrator {
                     position_ms, "resume_after_exclusive_device_released"
                 );
             }
+            // #6264 — un lecteur qui relit mal sa mémoire après une longue
+            // pause (Eversolo DMP-A8, bruit blanc) : la zone qui l'arme reprend
+            // par un NOUVEAU flux, à la position, comme après une session
+            // morte. Le `Play` sur place lui faisait rejouer sa mémoire.
+            let pause = state.paused_at.map(|t| t.elapsed());
+            let memoire_du_lecteur_douteuse =
+                crate::audio::reprise_nouveau_flux::relancer_par_nouveau_flux(
+                    crate::audio::reprise_nouveau_flux::seuil_de_la_zone(&self.db, zone_id),
+                    pause,
+                );
+            if memoire_du_lecteur_douteuse {
+                info!(
+                    zone_id,
+                    position_ms,
+                    pause_s = pause.map(|p| p.as_secs()),
+                    "reprise_par_nouveau_flux_apres_longue_pause"
+                );
+            }
+            let peripherique_rendu = peripherique_rendu || memoire_du_lecteur_douteuse;
             let decision = reprise_de_session(
                 est_radio,
                 rejouable,
@@ -3714,6 +3755,12 @@ impl PlaybackOrchestrator {
             let is_local_output =
                 zone_output_type.as_deref() == Some("local") || zone_output_type.is_none();
             let is_oaat_output = zone_output_type.as_deref() == Some("oaat");
+            // #6370 — la sortie d'un agent Tune est une sortie LOCALE de
+            // l'agent : elle lit son flux d'un bout à l'autre et son `seek` ne
+            // fait que noter la position (`LocalOutput::seek`). Le maître
+            // relance donc le flux à la position, comme pour sa propre sortie
+            // locale ; les agents installés n'ont rien à changer.
+            let is_agent_tune_output = zone_output_type.as_deref() == Some(TYPE_SORTIE_AGENT_TUNE);
             let has_track = state.now_playing.is_some();
             // #6017 (Cyrille, fil 2194, Yamaha R-N2000A) — une piste de la
             // BIBLIOTHÈQUE convertie à la volée (AAC → WAV) est servie par un
@@ -3743,7 +3790,7 @@ impl PlaybackOrchestrator {
                     self.playback.seek(zone_id, original_position_ms).await;
                     return Err(OutputCommandError::failed(OutputCommand::Seek, e));
                 }
-            } else if (is_local_output || is_oaat_output) && has_track {
+            } else if (is_local_output || is_oaat_output || is_agent_tune_output) && has_track {
                 info!(zone_id, position_ms, "seek_local_output_recreating_stream");
                 match self
                     .replay_zone_at_position(zone_id, position_ms, "seek")

@@ -481,6 +481,17 @@ fn inject_device_identity(
         "detected_model".into(),
         json!(detected.filter(|_| !effacee).and_then(|d| d.model.clone())),
     );
+    // #6546 — la plage MAC reconnue et sa marque, comme sur `GET /devices`.
+    // Même règle que la détection juste au-dessus : une identité récusée
+    // (#3660) ne se republie pas par la porte de l'OUI. Seuls les trois
+    // premiers octets sortent ; la MAC complète n'est pas publiée ici.
+    let (mac_prefix, mac_vendor) = tune_core::discovery::mac::plage_et_marque(
+        detected
+            .filter(|_| !effacee)
+            .and_then(|d| d.mac_address.as_deref()),
+    );
+    obj.insert("mac_prefix".into(), json!(mac_prefix));
+    obj.insert("mac_vendor".into(), json!(mac_vendor));
 }
 
 pub fn router() -> Router<AppState> {
@@ -611,7 +622,11 @@ mod fusion_tests;
 #[cfg(test)]
 mod identite_appareil_tests;
 #[cfg(test)]
+mod oubli_du_dlna_decouvert_6299;
+#[cfg(test)]
 mod page_d_album_bandcamp_tests;
+#[cfg(test)]
+mod plages_mac_6546_tests;
 #[cfg(test)]
 mod sante_reseau_de_zone_tests;
 #[cfg(test)]
@@ -1402,7 +1417,8 @@ pub(crate) async fn output_reach(state: &AppState, zone: &Zone, ps: &ZoneState) 
                 .streamer
                 .stream_bytes_sent(sid)
                 .await
-                .is_some_and(|n| n > 0),
+                // #6066 — une sonde de plage n'est pas un onglet qui joue.
+                .is_some_and(tune_core::poller::octets_d_une_ecoute),
             None => false,
         }
     } else {
@@ -1559,6 +1575,7 @@ fn output_reach_of(
 }
 
 mod signal_path;
+pub(crate) mod textes_signal;
 pub use signal_path::*;
 
 mod ecriture;
@@ -1601,6 +1618,8 @@ mod signal_path_reaffectation_6044_tests;
 mod signal_path_pure_replaygain_5633_tests;
 
 // #4384 — ReplayGain sans gain tagué, et où le gain s'applique.
+#[cfg(test)]
+mod signal_path_decodeur_sortie_pull_6178_tests;
 #[cfg(test)]
 mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.

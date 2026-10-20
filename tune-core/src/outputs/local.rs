@@ -684,6 +684,20 @@ pub struct LocalOutput {
     /// When set, the playback loop skips the room-correction convolver so the
     /// signal path stays bit-perfect. Set per-play by the orchestrator.
     pure_bypass: Arc<AtomicBool>,
+    /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
+    /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
+    /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
+    ///
+    /// Le verdict PURE ne peut pas se lire dans la chaîne vivante : PURE la
+    /// VIDE (les chargeurs de l'orchestrateur rendent `None` en PURE), donc
+    /// sous PURE la chaîne dit toujours « rien d'armé ». Seuls les réglages
+    /// disent ce que PURE contourne. Lu par `signal_path_status`.
+    pure_contourne_un_reglage: Arc<AtomicBool>,
+    /// #6211 — la lecture en cours est-elle un flux SANS FIN (radio) ? Posé
+    /// par l'orchestrateur à chaque lecture, d'après `live_stream`. Armé, le
+    /// préampli gardé d'un égaliseur coupé s'éteint en fondu au lieu de
+    /// valoir jusqu'à une piste suivante qui ne viendra pas.
+    flux_sans_fin: AtomicBool,
     /// #3973 — « bit-perfect strict » de la zone qui joue sur cette sortie.
     /// Armé, une conversion de fréquence (ouverture cpal ou changement de
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
@@ -1234,6 +1248,8 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
+            flux_sans_fin: AtomicBool::new(false),
+            pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
@@ -1281,6 +1297,7 @@ impl LocalOutput {
                     .as_ref()
                     .and_then(|p| p.reporter_le_preampli_garde());
             }
+            self.eteindre_si_flux_sans_fin(&mut eq);
             *emplacement = eq;
         }
         self.recalculer_la_compensation();
@@ -1383,11 +1400,31 @@ impl LocalOutput {
                 // #5215 — héritage des filtres ET, si le niveau bouge
                 // (coupure, activation, préampli déplacé), fondu enchaîné de
                 // `RAMPE_DE_BASCULE_MS` au lieu d'une marche instantanée.
-                super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent)
+                let mut releve =
+                    super::super::audio::eq::EqProcessor::prendre_la_releve(eq, precedent);
+                self.eteindre_si_flux_sans_fin(&mut releve);
+                releve
             };
         }
         // Verrou relâché : la compensation relit l'égaliseur ET le crossfeed.
         self.recalculer_la_compensation();
+    }
+
+    /// #6211 — dire à la sortie si la lecture qui commence est un flux sans
+    /// fin (radio). Posé AVANT `set_eq` par l'orchestrateur.
+    pub fn set_flux_sans_fin(&self, sans_fin: bool) {
+        self.flux_sans_fin.store(sans_fin, Ordering::Relaxed);
+    }
+
+    /// #6211 (décision du 19/10) — sur un flux sans fin, le préampli gardé
+    /// par un égaliseur coupé s'éteint en fondu ; sur une piste, la règle
+    /// #5215 reste entière (rien ne change).
+    fn eteindre_si_flux_sans_fin(&self, eq: &mut Option<super::super::audio::eq::EqProcessor>) {
+        if self.flux_sans_fin.load(Ordering::Relaxed)
+            && let Some(eq) = eq.as_mut()
+        {
+            eq.eteindre_le_preampli_garde();
+        }
     }
 
     pub fn has_eq(&self) -> bool {
@@ -1525,6 +1562,35 @@ impl LocalOutput {
         self.recalculer_la_compensation();
     }
 
+    /// #6522, #6524 — dire à la sortie si les réglages ENREGISTRÉS de la zone
+    /// qui joue arment un traitement que PURE contourne. Posé par
+    /// l'orchestrateur à chaque lecture, à chaque bascule PURE et à chaque
+    /// réglage poussé à chaud, d'après `Orchestrator::pure_contourne_un_reglage`.
+    pub fn set_pure_contourne_un_reglage(&self, arme: bool) {
+        self.pure_contourne_un_reglage
+            .store(arme, Ordering::Relaxed);
+    }
+
+    /// Publie le contrat de signal comme le fait le callback Windows (même
+    /// fonction, mêmes emplacements de la sortie), pour les tests : sans carte
+    /// son, c'est la seule façon de lire le verdict que lit le poller après
+    /// une vraie bascule de l'orchestrateur.
+    #[cfg(test)]
+    pub(crate) fn publier_le_contrat_pour_test(&self) {
+        publish_windows_signal_path_status(
+            &self.signal_path_status,
+            true,
+            true,
+            false,
+            1000,
+            &self.eq,
+            &self.convolver,
+            &self.crossfeed,
+            &self.pure_bypass,
+            &self.mono_downmix,
+        );
+    }
+
     /// #3973 — armer (ou désarmer) « bit-perfect strict » pour la zone qui
     /// joue sur cette sortie. Posé par l'orchestrateur à chaque lecture, à
     /// côté de `set_pure_bypass`.
@@ -1599,6 +1665,31 @@ impl LocalOutput {
     /// #6044 — le dernier bloc converti est-il passé par la matrice ?
     pub fn reaffectation_appliquee(&self) -> bool {
         self.reaffectation.appliquee()
+    }
+
+    /// #6230 — la matrice posée demande-t-elle un autre nombre de voies que
+    /// celui de l'ouverture en cours ? Vrai seulement sur le chemin partagé,
+    /// le seul qui pilote ses voies, et jamais sans règle armée : une règle
+    /// qui passe de 6 → 6 à 6 → 2 en pleine lecture, une piste enchaînée à
+    /// laquelle la règle de la zone s'applique, ou une règle retirée (ou une
+    /// entrée en PURE) après une ouverture pilotée. L'orchestrateur rouvre
+    /// alors la sortie à la position courante.
+    pub fn les_voies_imposent_de_rouvrir(&self) -> bool {
+        let Some(pilotage) = self.reaffectation.pilotage() else {
+            return false;
+        };
+        let Some(reel) = self.transformations_reelles.lock().ok().and_then(|t| *t) else {
+            return false;
+        };
+        let (source, ouvertes) = (reel.entree().canaux(), reel.ouvert().canaux);
+        let voulues = if self.pure_bypass.load(Ordering::Relaxed)
+            || self.dop_active.load(Ordering::Relaxed)
+        {
+            None
+        } else {
+            self.reaffectation.voies_de_la_matrice(source)
+        };
+        reaffectation::rouvrir_pour_les_voies(voulues, pilotage, ouvertes, source)
     }
 
     /// #6057 — poser la disposition DÉCLARÉE par le fichier de la piste
@@ -3188,7 +3279,23 @@ pub(crate) fn cascade_de_formats(
     principal: &cpal::StreamConfig,
     source: &cpal::StreamConfig,
 ) -> Vec<(cpal::StreamConfig, FormatDeSortie)> {
-    let mut cadences = vec![principal.clone()];
+    cascade_de_formats_avec_la_matrice(None, principal, source)
+}
+
+/// #6230 — [`cascade_de_formats`], précédée des voies que demande une matrice
+/// de réaffectation armée (`matrice`, à la cadence retenue). Sans matrice, la
+/// cascade est exactement celle d'avant.
+pub(crate) fn cascade_de_formats_avec_la_matrice(
+    matrice: Option<&cpal::StreamConfig>,
+    principal: &cpal::StreamConfig,
+    source: &cpal::StreamConfig,
+) -> Vec<(cpal::StreamConfig, FormatDeSortie)> {
+    let mut cadences: Vec<cpal::StreamConfig> = matrice
+        .filter(|m| m.sample_rate != principal.sample_rate || m.channels != principal.channels)
+        .into_iter()
+        .cloned()
+        .collect();
+    cadences.push(principal.clone());
     if source.sample_rate != principal.sample_rate || source.channels != principal.channels {
         cadences.push(source.clone());
     }
@@ -3721,6 +3828,29 @@ fn local_dsp_runtime_state(
         OutputDspState::Applied
     } else {
         OutputDspState::Inactive
+    }
+}
+
+/// #6522, #6524 — corrige le « rien à contourner » de
+/// `local_dsp_runtime_state` par les réglages enregistrés de la zone.
+///
+/// Sous PURE, la chaîne vivante est vide PAR CONSTRUCTION : l'orchestrateur y
+/// installe les `None` que ses chargeurs rendent en PURE. Son « rien d'armé »
+/// ne prouve donc rien. Quand les réglages arment un traitement
+/// (`reglage_arme`), PURE le contourne : le verdict est `BypassedPure`. Les
+/// autres verdicts ne sont pas touchés.
+///
+/// Chemin complet du type : l'import court n'existe que sous Windows et en
+/// test, et `signal_path_status` est compilé partout.
+fn verdict_pure_selon_les_reglages(
+    dsp: super::traits::OutputDspState,
+    reglage_arme: bool,
+) -> super::traits::OutputDspState {
+    use super::traits::OutputDspState;
+    if reglage_arme && dsp == OutputDspState::PureSansObjet {
+        OutputDspState::BypassedPure
+    } else {
+        dsp
     }
 }
 
@@ -5192,6 +5322,8 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.transformations_reelles.lock() {
             *slot = None;
         }
+        // #6230 — l'ouverture d'avant ne décrit plus rien.
+        self.reaffectation.noter_l_ouverture(None);
         let open_failure = self.open_failure.clone();
         let transformations_reelles = self.transformations_reelles.clone();
         #[cfg(target_os = "windows")]
@@ -5698,7 +5830,20 @@ impl OutputTarget for LocalOutput {
                 // jusque-là échouer la première et unique tentative, et la
                 // zone s'arrêtait sans cause affichée. Tout ce qui vient d'un
                 // serveur multimédia arrive par cette branche.
-                let tentatives = cascade_de_formats(&output_config, &source_config);
+                // #6230 — une matrice armée qui change le nombre de voies les
+                // demande d'abord ; un refus laisse la cascade d'avant.
+                let voies_de_la_matrice = reaffectation
+                    .voies_de_la_matrice(dec_ch)
+                    .filter(|_| !pure_bypass.load(Ordering::Relaxed));
+                let config_de_la_matrice = voies_de_la_matrice.map(|voies| cpal::StreamConfig {
+                    channels: voies,
+                    ..output_config.clone()
+                });
+                let tentatives = cascade_de_formats_avec_la_matrice(
+                    config_de_la_matrice.as_ref(),
+                    &output_config,
+                    &source_config,
+                );
                 let anneaux: std::cell::RefCell<Option<Arc<RingBuf>>> =
                     std::cell::RefCell::new(None);
                 let ouverture = ouvrir_premier_format_accepte(&tentatives, |cfg, format| {
@@ -5809,6 +5954,7 @@ impl OutputTarget for LocalOutput {
                 }
                 let output_sr = actual_config.sample_rate;
                 let output_ch = actual_config.channels;
+                reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
                 info!(
                     device = %device_name,
@@ -6308,8 +6454,18 @@ impl OutputTarget for LocalOutput {
             // `BackendCpal::ouvrir` (`local/backend.rs`). `play_url` ne crée
             // plus d'anneau et n'en passe plus d'`Arc` (D2) : il reçoit un
             // backend, lui demande son format, son puits et une observation.
+            // #6230 — une matrice armée qui change le nombre de voies (6 → 2)
+            // les demande au périphérique ; sinon rien ne change. L'amorce
+            // lue avec l'en-tête suffit à écarter un porteur DoP.
+            let voies_de_la_matrice = reaffectation.voies_a_demander(
+                spec,
+                header_buf.get(data_offset..).unwrap_or_default(),
+                pure_bypass.load(Ordering::Relaxed),
+                dop_active.load(Ordering::Relaxed),
+            );
             let demande = DemandeDOuverture {
                 spec,
+                voies_de_la_matrice,
                 device_name: &device_name,
                 endpoint_id: endpoint_id.as_deref(),
                 origin_host: origin_host.as_deref(),
@@ -6342,6 +6498,7 @@ impl OutputTarget for LocalOutput {
 
             let output_sr = sortie.cadence;
             let output_ch = sortie.canaux;
+            reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
             info!(
                 device = %device_name,
@@ -7414,10 +7571,16 @@ impl OutputTarget for LocalOutput {
     }
 
     fn signal_path_status(&self) -> Option<OutputSignalPathStatus> {
-        self.signal_path_status
+        let mut status = self
+            .signal_path_status
             .lock()
             .ok()
-            .and_then(|status| status.clone())
+            .and_then(|status| status.clone())?;
+        status.dsp = verdict_pure_selon_les_reglages(
+            status.dsp,
+            self.pure_contourne_un_reglage.load(Ordering::Relaxed),
+        );
+        Some(status)
     }
 
     /// REF-6b (#2219) : ce que l'étage courant a déclaré par

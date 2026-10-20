@@ -286,6 +286,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6179 -- --nocapture
 
+      # #6545 — notes de la communauté : l'instantané des notes d'album
+      # (`LIMIT ?` lié, `CAST(… AS BIGINT)`, jointures), l'upsert et le retrait
+      # d'une note, l'empreinte et le consentement gardés dans `settings`, et
+      # la lecture artiste/album de la route, contre un faux site. Tables
+      # TEMPORAIRES copiées des vraies : rien n'est écrit dans la base.
+      - name: Notes de la communauté sur PostgreSQL (#6545)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_6545 -- --nocapture
+
       # #5003 — les gardes de migration lisent le schéma COURANT : un schéma
       # voisin portant les mêmes tables (tout-TEXT, ou déjà BIGINT) ne doit
       # rien changer au schéma que Tune reçoit. Le test monte SES bases
@@ -762,7 +772,9 @@ jobs:
       # ALBUMARTIST dans les collections, sous-requête corrélée sur
       # `al.artist_id` dans les playlists. Les deux aperçus par le vrai
       # routeur ; sans cette étape, l'épreuve prendrait son « saut annoncé ».
-      - name: Règle Artiste de l'album sur PostgreSQL (#6121)
+      # #6232 — même fichier : la règle « Interprète » (balise ARTIST de la
+      # piste dans `track_metadata`, tenue d'artiste lue par `LIKE`).
+      - name: Règle Artiste de l'album sur PostgreSQL (#6121, #6232)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_artiste_de_l_album_6121 -- --nocapture --test-threads=1

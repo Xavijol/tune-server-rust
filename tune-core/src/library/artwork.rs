@@ -828,8 +828,9 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
     }
     let query = format!("artist:\"{}\"", trimmed.replace('"', ""));
     let url = format!(
-        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit=1",
-        urlencoding::encode(&query)
+        "https://musicbrainz.org/ws/2/artist/?query={}&fmt=json&limit={}",
+        urlencoding::encode(&query),
+        crate::metadata::MB_ARTIST_CANDIDATES
     );
     let client = crate::http::client::builder()
         .user_agent(MB_USER_AGENT)
@@ -847,13 +848,9 @@ pub async fn search_musicbrainz_artist(name: &str) -> Option<String> {
         return None;
     }
     let data: serde_json::Value = resp.json().await.ok()?;
-    let first = data.get("artists")?.as_array()?.first()?;
-    // Only accept a confident match; MB scores the query 0-100.
-    let score = first.get("score").and_then(|v| v.as_i64()).unwrap_or(0);
-    if score < 90 {
-        return None;
-    }
-    first.get("id")?.as_str().map(|s| s.to_string())
+    // #6463 — un score élevé ne dit pas l'identité : « Christophe » rendait
+    // d'abord Christophe Beck. Seul un nom identique, et unique, est retenu.
+    crate::metadata::mb_choisir_artiste(&data, trimmed)
 }
 
 /// Run batch artwork enrichment for all albums missing cover art.
@@ -1421,10 +1418,7 @@ async fn fetch_image_from_wikidata(client: &reqwest::Client, qid: &str) -> Optio
 /// accents NI la ponctuation. « Motorhead » et « Motörhead » sont deux entrées
 /// distinctes ; les confondre poserait la mauvaise image.
 fn artist_name_matches_exactly(candidate: &str, wanted: &str) -> bool {
-    let candidate = candidate.trim();
-    let wanted = wanted.trim();
-    // Un nom vide se « retrouve » partout : il ne départage rien.
-    !candidate.is_empty() && !wanted.is_empty() && candidate.to_lowercase() == wanted.to_lowercase()
+    crate::metadata::noms_d_artiste_identiques(candidate, wanted)
 }
 
 /// Retire le désambiguïsateur numérique que Discogs accole aux homonymes :
@@ -2080,7 +2074,9 @@ async fn batch_enrich_artist_artwork_inner(
     let contribution_consentie = crate::cloud::consent::contribution_autorisee(&settings);
     // Discogs token as configured in the app UI (stored in settings), so the
     // by-name Discogs image lookup actually works (Progman: no artist images).
-    let discogs_token = settings
+    // Le jeton PERSONNEL (Réglages ▸ Clés d'API, #4805 lot 1) passe devant ;
+    // l'intégré — réglage, puis environnement — sert à défaut.
+    let integre = settings
         .get("discogs_token")
         .ok()
         .flatten()
@@ -2095,6 +2091,12 @@ async fn batch_enrich_artist_artwork_inner(
                 .ok()
                 .filter(|s| !s.is_empty())
         });
+    let discogs_token = crate::cles_api::resoudre_pour_le_serveur(
+        &settings,
+        crate::cles_api::Service::Discogs,
+        integre,
+    )
+    .map(crate::cles_api::CleResolue::into_valeur);
 
     // La clé Last.fm, résolue comme le jeton Discogs juste au-dessus : le
     // réglage saisi dans Tune d'abord, l'environnement à défaut (#2257).
