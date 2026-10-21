@@ -1735,6 +1735,13 @@ required-features = ["postgres"]
 name = "services_remplacables_6336"
 path = "tests/services_remplacables_6336.rs"
 
+# #6336 (suite) — le battement de la licence et la liaison SSO du serveur au
+# compte, contre un faux mozaiklabs déclaré par `services_factices`
+# (`substituer_base`). Binaire à lui seul pour la même raison.
+[[test]]
+name = "licence_sso_remplacables_6336"
+path = "tests/licence_sso_remplacables_6336.rs"
+
 # #6454 — `GET /profiles` ne rend plus `200 []` sur une base en échec : un
 # 500 au code lisible, et une ligne ERROR au journal. Abonné `tracing` GLOBAL,
 # donc un binaire à lui seul et un seul essai dedans (leçon de
